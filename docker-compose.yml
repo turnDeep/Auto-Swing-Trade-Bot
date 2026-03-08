@@ -9,7 +9,10 @@ services:
       - WEBULL_APP_KEY=${WEBULL_APP_KEY}
       - WEBULL_APP_SECRET=${WEBULL_APP_SECRET}
       - WEBULL_ACCOUNT_ID=${WEBULL_ACCOUNT_ID}
+      - FMP_API_KEY=${FMP_API_KEY}
       - TZ=America/New_York
+    env_file:
+      - .env
     volumes:
       - ./:/app
     command: python master_scheduler.py

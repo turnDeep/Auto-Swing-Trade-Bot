@@ -47,11 +47,12 @@ cd Stallion-System-Trade
 ```
 
 ### 2. 環境変数（API認証情報）のセット
-Webull OpenAPIで発行したキーボード情報を、OSの環境変数として登録します。
-```bash
-export WEBULL_APP_KEY="あなたのApp Key"
-export WEBULL_APP_SECRET="あなたのApp Secret"
-export WEBULL_ACCOUNT_ID="あなたの口座ID"
+プロジェクトのルートディレクトリに `.env` ファイルを作成し、APIキー等の情報を記述します。（`.env.example` を参考にしてください）
+```env
+WEBULL_APP_KEY="あなたのApp Key"
+WEBULL_APP_SECRET="あなたのApp Secret"
+WEBULL_ACCOUNT_ID="あなたの口座ID"
+FMP_API_KEY="あなたのFMP API Key"
 ```
 
 ### 3. Docker Composeで一撃デプロイ
