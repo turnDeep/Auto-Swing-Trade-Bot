@@ -1,5 +1,6 @@
 import os
 import pickle
+import json
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -11,7 +12,10 @@ def calculate_adr(df):
     daily = df.resample('D').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
     if len(daily) < 2: return 0
     daily['adr'] = (daily['high'] - daily['low']) / daily['low']
-    return daily['adr'].mean()
+    # Use Exponential Moving Average (EMA) to weight recent volatility more heavily,
+    # effectively ignoring old spikes (like RGC earlier in the period).
+    # span=14 is roughly equivalent to a 14-day moving average but exponentially weighted.
+    return daily['adr'].ewm(span=14, adjust=False).mean().iloc[-1]
 
 def run_portfolio_sim(top_100_symbols, trades_dict):
     all_events = []
@@ -240,7 +244,6 @@ def main():
 
     # Save the Top 10 to a file for the live trader
     top_10 = top_symbols_test[:10]
-    import json
     with open('top_10_watchlist.json', 'w') as f:
         json.dump(top_10, f)
     print(f"\nSaved Top 10 watchlist for the week: {top_10}")

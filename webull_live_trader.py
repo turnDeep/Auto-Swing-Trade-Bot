@@ -4,6 +4,7 @@ import datetime
 import pytz
 import logging
 import pickle
+import json
 import uuid
 from webullsdkcore.client import ApiClient
 from webullsdkcore.common.enums import Region
@@ -31,7 +32,6 @@ def init_webull_client():
 def get_top_10_watchlist():
     try:
         # Load the latest top 10 calculated by the weekend scheduler PCA
-        import json
         with open('top_10_watchlist.json', 'r') as f:
             return json.load(f)
     except Exception as e:
