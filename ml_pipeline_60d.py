@@ -238,5 +238,12 @@ def main():
         print(f"Total OOS Trades Executed: {test_trades}")
     print("==================================================")
 
+    # Save the Top 10 to a file for the live trader
+    top_10 = top_symbols_test[:10]
+    import json
+    with open('top_10_watchlist.json', 'w') as f:
+        json.dump(top_10, f)
+    print(f"\nSaved Top 10 watchlist for the week: {top_10}")
+
 if __name__ == '__main__':
     main()

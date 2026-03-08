@@ -31,7 +31,9 @@ def init_webull_client():
 def get_top_10_watchlist():
     try:
         # Load the latest top 10 calculated by the weekend scheduler PCA
-        return ["RGC", "APLD", "ASTS", "AAOI", "FRMI", "SOUN", "NVDA", "MSTR", "SMCI", "ARM"]
+        import json
+        with open('top_10_watchlist.json', 'r') as f:
+            return json.load(f)
     except Exception as e:
         logger.error(f"Could not load watchlist: {e}")
         return []
