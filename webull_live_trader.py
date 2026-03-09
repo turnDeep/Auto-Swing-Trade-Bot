@@ -73,33 +73,25 @@ def place_order(api, symbol, side, qty, order_type="MARKET", limit_price=None):
 def get_buying_power(trade_api):
     """Fetch the actual account cash balance (buying power) from Webull API."""
     try:
-        res = trade_api.account.get_account_balance(ACCOUNT_ID, Currency.USD.value)
+        # Webull Japan only accepts JPY for the base currency parameter, otherwise throws 401 Unauthorized
+        res = trade_api.account.get_account_balance(ACCOUNT_ID, 'JPY')
         if res.status_code == 200:
             data = res.json()
-            # Parse buying power from the response
-            # The API may return various balance fields; try common ones
-            if isinstance(data, dict):
-                buying_power = (
-                    data.get('buying_power') or 
-                    data.get('buyingPower') or 
-                    data.get('cash_balance') or 
-                    data.get('cashBalance') or 
-                    data.get('net_liquidation') or
-                    data.get('netLiquidation') or
-                    data.get('total_cash') or
-                    data.get('totalCash', 0)
-                )
-                # Some responses nest balances inside account_balance_list
-                if not buying_power and 'account_balance_list' in data:
-                    for bal in data['account_balance_list']:
-                        if bal.get('currency') == 'USD':
-                            buying_power = bal.get('cash_balance') or bal.get('net_liquidation', 0)
-                            break
-                if buying_power:
-                    bp = float(buying_power)
-                    logger.info(f"Account Buying Power (USD): ${bp:,.2f}")
-                    return bp
-            logger.warning(f"Could not parse buying power from response: {data}")
+            # Extract USD balance from the account_currency_assets array
+            buying_power = 0.0
+            if 'account_currency_assets' in data:
+                for asset in data['account_currency_assets']:
+                    if asset.get('currency') == 'USD':
+                        bp = asset.get('buying_power') or asset.get('cash_balance') or asset.get('available_to_exchange', 0)
+                        buying_power = float(bp)
+                        break
+            
+            if buying_power > 0:
+                logger.info(f"Account Buying Power (USD): ${buying_power:,.2f}")
+                return buying_power
+            else:
+                logger.warning(f"No USD buying power found in response. (Only JPY found?) Payload: {data}")
+                return 0.0
         else:
             logger.error(f"Account balance API failed: {res.status_code} - {res.text}")
     except Exception as e:
