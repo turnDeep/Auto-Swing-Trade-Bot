@@ -1,5 +1,6 @@
 import os
 import pickle
+import json
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -9,9 +10,41 @@ from optimizer import optimize_strategy
 
 def calculate_adr(df):
     daily = df.resample('D').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
-    if len(daily) < 2: return 0
+    n_days = len(daily)
+    if n_days < 2: return 0
+
     daily['adr'] = (daily['high'] - daily['low']) / daily['low']
-    return daily['adr'].mean()
+
+    # ユーザー提案のマルチタイムフレーム加重平均
+    # 5日: 40%, 15日: 30%, 30日: 20%, 60日(全体): 10%
+    weights = []
+    values = []
+
+    if n_days >= 5:
+        weights.append(0.40)
+        values.append(daily['adr'].iloc[-5:].mean())
+    elif n_days > 0:
+        weights.append(0.40)
+        values.append(daily['adr'].mean())
+
+    if n_days >= 15:
+        weights.append(0.30)
+        values.append(daily['adr'].iloc[-15:].mean())
+
+    if n_days >= 30:
+        weights.append(0.20)
+        values.append(daily['adr'].iloc[-30:].mean())
+
+    # 全体（60日想定）
+    weights.append(0.10)
+    values.append(daily['adr'].mean())
+
+    # 日数が足りず一部の期間が計算できなかった場合、合計が1になるように正規化する
+    total_weight = sum(weights)
+    normalized_weights = [w / total_weight for w in weights]
+
+    final_adr = sum(v * w for v, w in zip(values, normalized_weights))
+    return final_adr
 
 def run_portfolio_sim(top_100_symbols, trades_dict):
     all_events = []
@@ -240,7 +273,6 @@ def main():
 
     # Save the Top 10 to a file for the live trader
     top_10 = top_symbols_test[:10]
-    import json
     with open('top_10_watchlist.json', 'w') as f:
         json.dump(top_10, f)
     print(f"\nSaved Top 10 watchlist for the week: {top_10}")
