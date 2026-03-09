@@ -5,82 +5,60 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from tqdm import tqdm
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 from backtester import run_backtest
-from optimizer import optimize_strategy
+
+COMM_RATE = 0.00132
 
 def calculate_adr(df):
+    """Simple ADR calculation (proven optimal for PCA PC1)"""
     daily = df.resample('D').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
-    n_days = len(daily)
-    if n_days < 2: return 0
-
+    if len(daily) < 2: return 0
     daily['adr'] = (daily['high'] - daily['low']) / daily['low']
+    return daily['adr'].mean()
 
-    # ユーザー提案のマルチタイムフレーム加重平均
-    # 5日: 40%, 15日: 30%, 30日: 20%, 60日(全体): 10%
-    weights = []
-    values = []
-
-    if n_days >= 5:
-        weights.append(0.40)
-        values.append(daily['adr'].iloc[-5:].mean())
-    elif n_days > 0:
-        weights.append(0.40)
-        values.append(daily['adr'].mean())
-
-    if n_days >= 15:
-        weights.append(0.30)
-        values.append(daily['adr'].iloc[-15:].mean())
-
-    if n_days >= 30:
-        weights.append(0.20)
-        values.append(daily['adr'].iloc[-30:].mean())
-
-    # 全体（60日想定）
-    weights.append(0.10)
-    values.append(daily['adr'].mean())
-
-    # 日数が足りず一部の期間が計算できなかった場合、合計が1になるように正規化する
-    total_weight = sum(weights)
-    normalized_weights = [w / total_weight for w in weights]
-
-    final_adr = sum(v * w for v, w in zip(values, normalized_weights))
-    return final_adr
-
-def run_portfolio_sim(top_100_symbols, trades_dict):
+def run_single_trade_sim(ranking_df, trades_dict):
+    """Concentrated 1-trade/day simulation (90% capital)"""
     all_events = []
-    trade_id_counter = 0
-    for sym in top_100_symbols:
+    for sym in ranking_df['Symbol']:
         trades = trades_dict.get(sym)
         if trades is not None and not trades.empty:
             for t in trades.itertuples():
-                all_events.append({'time': t.entry_time, 'type': 'ENTRY', 'id': trade_id_counter, 'symbol': sym, 'pnl_pct': t.pnl_pct})
-                all_events.append({'time': t.exit_time, 'type': 'EXIT', 'id': trade_id_counter, 'symbol': sym, 'pnl_pct': t.pnl_pct})
-                trade_id_counter += 1
+                rank = ranking_df[ranking_df['Symbol'] == sym]['Rank'].values[0]
+                all_events.append({
+                    'symbol': sym, 'rank': rank, 'date': t.entry_time.date(),
+                    'entry_time': t.entry_time, 'exit_time': t.exit_time, 
+                    'pnl_pct': t.pnl_pct
+                })
                 
-    all_events.sort(key=lambda x: (x['time'], 0 if x['type'] == 'EXIT' else 1))
+    if not all_events: return 10000.0, 0, 0
+    
+    events_df = pd.DataFrame(all_events)
+    events_df.sort_values(['date', 'entry_time', 'rank'], ascending=[True, True, True], inplace=True)
     
     STARTING_CAPITAL = 10000.0
-    RISK_PER_TRADE = 0.10
     capital = STARTING_CAPITAL
-    cash = STARTING_CAPITAL
-    active_trades = {}
+    trade_count = 0
+    wins = 0
     
-    for ev in all_events:
-        if ev['type'] == 'ENTRY':
-            trade_size = capital * RISK_PER_TRADE
-            actual_investment = min(trade_size, cash)
-            if actual_investment >= 10:
-                cash -= actual_investment
-                active_trades[ev['id']] = actual_investment
-        elif ev['type'] == 'EXIT':
-            trade_id = ev['id']
-            if trade_id in active_trades:
-                invested = active_trades.pop(trade_id)
-                profit = invested * ev['pnl_pct']
-                cash += (invested + profit)
-                capital += profit
-                
-    return capital, trade_id_counter
+    for d, daily_trades in events_df.groupby('date'):
+        first_trade = daily_trades.iloc[0]
+        trade_size = capital * 0.90  # 90% capital allocation
+        
+        entry_commission = trade_size * COMM_RATE
+        gross_exit_value = trade_size * (1 + first_trade['pnl_pct'])
+        exit_commission = gross_exit_value * COMM_RATE
+        
+        net_profit = (trade_size * first_trade['pnl_pct']) - entry_commission - exit_commission
+        capital += net_profit
+        trade_count += 1
+        
+        if net_profit > 0:
+            wins += 1
+            
+    win_rate = wins / trade_count if trade_count > 0 else 0
+    return capital, trade_count, win_rate
 
 def main():
     print("Loading universe symbols...")
@@ -107,8 +85,7 @@ def main():
                 df_batch.columns = [c.lower() for c in df_batch.columns]
                 try:
                     df_batch.index = df_batch.index.tz_convert('America/New_York').tz_localize(None)
-                except:
-                    pass
+                except: pass
                 data_60d[batch[0]] = df_batch
             else:
                 for sym in batch:
@@ -118,8 +95,7 @@ def main():
                             df_sym.columns = [c.lower() for c in df_sym.columns]
                             try:
                                 df_sym.index = df_sym.index.tz_convert('America/New_York').tz_localize(None)
-                            except:
-                                pass
+                            except: pass
                             data_60d[sym] = df_sym
                             
         with open(output_pkl, 'wb') as f:
@@ -142,140 +118,114 @@ def main():
     
     n_days = len(all_dates)
     if n_days < 20: 
-        print("Not enough days to do train/val/test splits!")
+        print("Not enough days to do train/test splits!")
         return
         
-    test_days_len = 5
-    val_days_len = 5
-    train_days_len = n_days - test_days_len - val_days_len
-    if train_days_len <= 0: train_days_len = 5
+    # Proven 40/20 train/test split
+    test_days_len = 20
+    train_days_len = n_days - test_days_len
+    if train_days_len <= 0: train_days_len = 40
     
-    train1_dates = all_dates[:train_days_len]
-    val_dates = all_dates[train_days_len:train_days_len+val_days_len]
-    
-    train2_dates = all_dates[val_days_len:train_days_len+val_days_len] 
-    test_dates = all_dates[train_days_len+val_days_len:]
+    train_dates = all_dates[:train_days_len]
+    test_dates = all_dates[train_days_len:]
     
     print(f"\n--- DATA SPLITS ---")
-    print(f"Train1 (Selection for Val): {len(train1_dates)} days ({train1_dates[0]} to {train1_dates[-1]})")
-    print(f"Validation (Hyperparam tuning): {len(val_dates)} days ({val_dates[0]} to {val_dates[-1]})")
-    print(f"Train2 (Selection for Test): {len(train2_dates)} days ({train2_dates[0]} to {train2_dates[-1]})")
+    print(f"Train (Feature Extraction & PCA): {len(train_dates)} days ({train_dates[0]} to {train_dates[-1]})")
     print(f"Test (Final OOS): {len(test_dates)} days ({test_dates[0]} to {test_dates[-1]})")
     
-    param_grid = {
-        "entry_start_time": ["09:35:00"], 
-        "entry_end_time": ["10:30:00"], 
-        "take_profit_pct": [0.10], 
-        "stop_loss_pct": [0.03],  
-        "min_volume_ratio": [1.0], 
-        "use_historical_rvol": [False]
+    core_params = {
+        "entry_start_time": "09:35:00", "entry_end_time": "10:30:00", 
+        "take_profit_pct": 0.10, "stop_loss_pct": 0.03,  
+        "min_volume_ratio": 1.0, "use_historical_rvol": False
     }
+    ROUND_TRIP = COMM_RATE * 2
     
-    def evaluate_period(dates, desc):
-        res = []
-        for sym, df in tqdm(data_60d.items(), desc=desc):
-            per_df = df.loc[str(dates[0]):str(dates[-1])]
-            if len(per_df) < 50: continue
+    train_stats = []
+    test_trades_dict = {}
+    
+    print("\n--- PHASE 1: FEATURE EXTRACTION (Train Data) ---")
+    for sym, df in tqdm(data_60d.items(), desc="Evaluating Train Data"):
+        train_df = df.loc[str(train_dates[0]):str(train_dates[-1])]
+        if len(train_df) < 100: continue
+        
+        adr = calculate_adr(train_df)
+        _, trades = run_backtest(train_df, core_params)
+        
+        if len(trades) > 0:
+            net_pnl = trades['pnl_pct'].sum() - (len(trades) * ROUND_TRIP)
+            wins = trades[(trades['pnl_pct'] - ROUND_TRIP) > 0]
+            win_rate = len(wins) / len(trades)
+            avg_win = wins['pnl_pct'].mean() if len(wins) > 0 else 0
             
-            adr = calculate_adr(per_df)
-            best_params, best_pnl, best_trades = optimize_strategy(per_df, param_grid, verbose=False)
-            if best_trades is not None and not best_trades.empty:
-                res.append({
-                    'Symbol': sym, 'ADR_pct': adr, 'Total_Trades': len(best_trades),
-                    'Win_Rate': len(best_trades[best_trades['pnl_pct'] > 0]) / len(best_trades),
-                    'Total_PnL': best_pnl, 'Params': best_params
-                })
-        return pd.DataFrame(res)
-        
-    def collect_trades(dates, desc):
-        trades_dict = {}
-        core_params = {
-            "entry_start_time": "09:35:00", "entry_end_time": "10:30:00", 
-            "take_profit_pct": 0.10, "stop_loss_pct": 0.03,  
-            "min_volume_ratio": 1.0, "use_historical_rvol": False
-        }
-        for sym, df in tqdm(data_60d.items(), desc=desc):
-            per_df = df.loc[str(dates[0]):str(dates[-1])]
-            if len(per_df) > 0:
-                _, trades = run_backtest(per_df, core_params)
-                trades_dict[sym] = trades
-        return trades_dict
-        
-    print("\n--- Precomputing Metrics ---")
-    train1_df = evaluate_period(train1_dates, "Evaluating Train1")
-    val_trades_dict = collect_trades(val_dates, "Collecting Val Trades")
+            # Extract features for PCA
+            train_stats.append({
+                'Symbol': sym, 'ADR': adr, 'Trades': len(trades),
+                'WinRate': win_rate, 'AvgWin': avg_win, 'TotalPnL': net_pnl
+            })
+            
+        test_df = df.loc[str(test_dates[0]):str(test_dates[-1])]
+        if len(test_df) > 0:
+            _, ts_trades = run_backtest(test_df, core_params)
+            test_trades_dict[sym] = ts_trades
+            
+    df_train = pd.DataFrame(train_stats).fillna(0)
+    print(f"Extracted features for {len(df_train)} stocks.")
     
-    train2_df = evaluate_period(train2_dates, "Evaluating Train2")
-    test_trades_dict = collect_trades(test_dates, "Collecting Test Trades")
+    print("\n--- PHASE 2: PRE-FILTERING & PCA SCORES ---")
+    # Apply optimal pre-filter: ADR >= 6%, WinRate >= 45%, Trades >= 5
+    filtered_df = df_train[(df_train['ADR'] >= 0.06) & 
+                           (df_train['WinRate'] >= 0.45) & 
+                           (df_train['Trades'] >= 5)].copy()
+                           
+    print(f"Stocks passing pre-filter (ADR>=6%, WinRate>=45%, Trades>=5): {len(filtered_df)}")
     
-    print("\n--- PHASE 2: VALIDATION (Grid Search) ---")
-    adr_thresholds = [0.03, 0.04, 0.05, 0.06]
-    trade_thresholds = [5, 10, 15, 20, 25, 30] 
-    win_rate_thresholds = [0.4, 0.45, 0.5, 0.55, 0.6]
+    if len(filtered_df) < 10:
+        print("Warning: Less than 10 stocks passed the filter. Using remaining stocks.")
+        if len(filtered_df) == 0:
+            print("Fallback: Reverting to no filter.")
+            filtered_df = df_train.copy()
+            
+    # Apply PCA (PC1 Ranking)
+    features = ['ADR', 'Trades', 'WinRate', 'AvgWin', 'TotalPnL']
+    X = filtered_df[features].values
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
     
-    results = []
+    pca = PCA(n_components=min(3, len(filtered_df)-1))
+    pca.fit(X_scaled)
     
-    for adr_th in adr_thresholds:
-        for tr_th in trade_thresholds:
-            for wr_th in win_rate_thresholds:
-                valid = train1_df[(train1_df['ADR_pct'] >= adr_th) & 
-                                     (train1_df['Total_Trades'] >= tr_th) & 
-                                     (train1_df['Win_Rate'] >= wr_th) & 
-                                     (train1_df['Total_PnL'] > 0)]
-                top_100 = valid.sort_values('Total_PnL', ascending=False).head(100)
-                
-                if len(top_100) == 0: continue
-                    
-                top_symbols = top_100['Symbol'].tolist()
-                final_cap, _ = run_portfolio_sim(top_symbols, val_trades_dict)
-                multiplier = final_cap / 10000.0
-                
-                results.append({
-                    'ADR_Min': adr_th, 'Trades_Min': tr_th, 'WinRate_Min': wr_th,
-                    'Selected_Stocks': len(top_100), 'Val_Return(%)': (multiplier-1)*100
-                })
-                
-    res_df = pd.DataFrame(results).sort_values('Val_Return(%)', ascending=False)
-    print("\nTop 5 Hyperparameter Combinations on Validation Set:")
-    print(res_df.head(5).to_string(index=False))
+    # PC1 Score (ADR/AvgWin Heavy)
+    scores = X_scaled.dot(pca.components_[0])
+    filtered_df['Score'] = scores
+    filtered_df.sort_values('Score', ascending=False, inplace=True)
+    filtered_df['Rank'] = np.arange(1, len(filtered_df) + 1)
     
-    best_params = res_df.iloc[0]
-    opt_adr = best_params['ADR_Min']
-    opt_tr = best_params['Trades_Min']
-    opt_wr = best_params['WinRate_Min']
-    
-    print(f"\n=> GOLDEN PARAMETERS SELECTED FROM VALIDATION:")
-    print(f"   ADR >= {opt_adr*100:.0f}%, Trades >= {opt_tr}, WinRate >= {opt_wr*100:.0f}%")
+    # Select Top 10
+    pool_size = 10
+    top_10 = filtered_df.head(pool_size)
+    print(f"\n=> SELECTED TOP {len(top_10)} STOCKS (PCA-PC1 Ranked)")
+    print(top_10[['Symbol', 'ADR', 'Trades', 'WinRate', 'AvgWin', 'Score']].to_string(index=False))
     
     print("\n--- PHASE 3: FINAL OUT-OF-SAMPLE TEST ---")
-    print(f"Applying Golden Parameters to Train2 ({len(train2_dates)} days) to select Test stocks...")
-    
-    valid_test = train2_df[(train2_df['ADR_pct'] >= opt_adr) & 
-                           (train2_df['Total_Trades'] >= opt_tr) & 
-                           (train2_df['Win_Rate'] >= opt_wr) & 
-                           (train2_df['Total_PnL'] > 0)]
-    top_100_test = valid_test.sort_values('Total_PnL', ascending=False).head(100)
-    
-    print(f"Selected {len(top_100_test)} stocks for Final Test.")
-    
-    top_symbols_test = top_100_test['Symbol'].tolist()
-    final_test_cap, test_trades = run_portfolio_sim(top_symbols_test, test_trades_dict)
+    # Simulate concentrated 1-trade/day on Top 10 using test data
+    final_cap, trade_count, win_rate = run_single_trade_sim(top_10, test_trades_dict)
     
     print("\n==================================================")
     print(f"--- FINAL OOS TEST PORTFOLIO RESULTS ({len(test_dates)} DAYS) ---")
     print(f"Starting Capital: $10,000.00")
-    print(f"Final Capital:    ${final_test_cap:,.2f}")
-    if final_test_cap > 0:
-        multiplier = final_test_cap / 10000.0
+    print(f"Final Capital:    ${final_cap:,.2f}")
+    if final_cap > 0:
+        multiplier = final_cap / 10000.0
         print(f"\nFinal Test Return: {multiplier:.3f}x ({(multiplier-1)*100:.2f}%)")
-        print(f"Total OOS Trades Executed: {test_trades}")
+        print(f"Total OOS Trades Executed: {trade_count}")
+        print(f"Overall OOS Win Rate: {win_rate*100:.1f}%")
     print("==================================================")
 
     # Save the Top 10 to a file for the live trader
-    top_10 = top_symbols_test[:10]
+    top_symbols = top_10['Symbol'].tolist()
     with open('top_10_watchlist.json', 'w') as f:
-        json.dump(top_10, f)
-    print(f"\nSaved Top 10 watchlist for the week: {top_10}")
+        json.dump(top_symbols, f)
+    print(f"\nSaved Top 10 watchlist for the week: {top_symbols}")
 
 if __name__ == '__main__':
     main()
