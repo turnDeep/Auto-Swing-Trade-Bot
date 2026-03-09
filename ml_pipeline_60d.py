@@ -18,47 +18,6 @@ def calculate_adr(df):
     daily['adr'] = (daily['high'] - daily['low']) / daily['low']
     return daily['adr'].mean()
 
-def run_single_trade_sim(ranking_df, trades_dict):
-    """Concentrated 1-trade/day simulation (90% capital)"""
-    all_events = []
-    for sym in ranking_df['Symbol']:
-        trades = trades_dict.get(sym)
-        if trades is not None and not trades.empty:
-            for t in trades.itertuples():
-                rank = ranking_df[ranking_df['Symbol'] == sym]['Rank'].values[0]
-                all_events.append({
-                    'symbol': sym, 'rank': rank, 'date': t.entry_time.date(),
-                    'entry_time': t.entry_time, 'exit_time': t.exit_time, 
-                    'pnl_pct': t.pnl_pct
-                })
-                
-    if not all_events: return 10000.0, 0, 0
-    
-    events_df = pd.DataFrame(all_events)
-    events_df.sort_values(['date', 'entry_time', 'rank'], ascending=[True, True, True], inplace=True)
-    
-    STARTING_CAPITAL = 10000.0
-    capital = STARTING_CAPITAL
-    trade_count = 0
-    wins = 0
-    
-    for d, daily_trades in events_df.groupby('date'):
-        first_trade = daily_trades.iloc[0]
-        trade_size = capital * 0.90  # 90% capital allocation
-        
-        entry_commission = trade_size * COMM_RATE
-        gross_exit_value = trade_size * (1 + first_trade['pnl_pct'])
-        exit_commission = gross_exit_value * COMM_RATE
-        
-        net_profit = (trade_size * first_trade['pnl_pct']) - entry_commission - exit_commission
-        capital += net_profit
-        trade_count += 1
-        
-        if net_profit > 0:
-            wins += 1
-            
-    win_rate = wins / trade_count if trade_count > 0 else 0
-    return capital, trade_count, win_rate
 
 def main():
     print("Loading universe symbols...")
@@ -118,20 +77,16 @@ def main():
     
     n_days = len(all_dates)
     if n_days < 20: 
-        print("Not enough days to do train/test splits!")
+        print("Not enough days for analysis!")
         return
         
-    # Proven 40/20 train/test split
-    test_days_len = 20
-    train_days_len = n_days - test_days_len
-    if train_days_len <= 0: train_days_len = 40
+    # PRODUCTION MODE: Use the most recent 40 days as training data
+    train_days_len = min(40, n_days)
+    train_dates = all_dates[-train_days_len:]  # Most recent 40 days
     
-    train_dates = all_dates[:train_days_len]
-    test_dates = all_dates[train_days_len:]
-    
-    print(f"\n--- DATA SPLITS ---")
-    print(f"Train (Feature Extraction & PCA): {len(train_dates)} days ({train_dates[0]} to {train_dates[-1]})")
-    print(f"Test (Final OOS): {len(test_dates)} days ({test_dates[0]} to {test_dates[-1]})")
+    print(f"\n--- PRODUCTION MODE ---")
+    print(f"Training on the most recent {len(train_dates)} days ({train_dates[0]} to {train_dates[-1]})")
+    print(f"Next week's live trading will use the Top 10 from this analysis.")
     
     core_params = {
         "entry_start_time": "09:35:00", "entry_end_time": "10:30:00", 
@@ -141,10 +96,9 @@ def main():
     ROUND_TRIP = COMM_RATE * 2
     
     train_stats = []
-    test_trades_dict = {}
     
-    print("\n--- PHASE 1: FEATURE EXTRACTION (Train Data) ---")
-    for sym, df in tqdm(data_60d.items(), desc="Evaluating Train Data"):
+    print("\n--- PHASE 1: FEATURE EXTRACTION ---")
+    for sym, df in tqdm(data_60d.items(), desc="Analyzing stocks"):
         train_df = df.loc[str(train_dates[0]):str(train_dates[-1])]
         if len(train_df) < 100: continue
         
@@ -157,16 +111,10 @@ def main():
             win_rate = len(wins) / len(trades)
             avg_win = wins['pnl_pct'].mean() if len(wins) > 0 else 0
             
-            # Extract features for PCA
             train_stats.append({
                 'Symbol': sym, 'ADR': adr, 'Trades': len(trades),
                 'WinRate': win_rate, 'AvgWin': avg_win, 'TotalPnL': net_pnl
             })
-            
-        test_df = df.loc[str(test_dates[0]):str(test_dates[-1])]
-        if len(test_df) > 0:
-            _, ts_trades = run_backtest(test_df, core_params)
-            test_trades_dict[sym] = ts_trades
             
     df_train = pd.DataFrame(train_stats).fillna(0)
     print(f"Extracted features for {len(df_train)} stocks.")
@@ -203,22 +151,11 @@ def main():
     # Select Top 10
     pool_size = 10
     top_10 = filtered_df.head(pool_size)
-    print(f"\n=> SELECTED TOP {len(top_10)} STOCKS (PCA-PC1 Ranked)")
-    print(top_10[['Symbol', 'ADR', 'Trades', 'WinRate', 'AvgWin', 'Score']].to_string(index=False))
-    
-    print("\n--- PHASE 3: FINAL OUT-OF-SAMPLE TEST ---")
-    # Simulate concentrated 1-trade/day on Top 10 using test data
-    final_cap, trade_count, win_rate = run_single_trade_sim(top_10, test_trades_dict)
     
     print("\n==================================================")
-    print(f"--- FINAL OOS TEST PORTFOLIO RESULTS ({len(test_dates)} DAYS) ---")
-    print(f"Starting Capital: $10,000.00")
-    print(f"Final Capital:    ${final_cap:,.2f}")
-    if final_cap > 0:
-        multiplier = final_cap / 10000.0
-        print(f"\nFinal Test Return: {multiplier:.3f}x ({(multiplier-1)*100:.2f}%)")
-        print(f"Total OOS Trades Executed: {trade_count}")
-        print(f"Overall OOS Win Rate: {win_rate*100:.1f}%")
+    print(f"STALLION TOP {len(top_10)} WATCHLIST FOR NEXT WEEK")
+    print("==================================================")
+    print(top_10[['Symbol', 'ADR', 'Trades', 'WinRate', 'AvgWin', 'Score']].to_string(index=False))
     print("==================================================")
 
     # Save the Top 10 to a file for the live trader
@@ -226,6 +163,7 @@ def main():
     with open('top_10_watchlist.json', 'w') as f:
         json.dump(top_symbols, f)
     print(f"\nSaved Top 10 watchlist for the week: {top_symbols}")
+    print("Ready for Monday trading.")
 
 if __name__ == '__main__':
     main()
