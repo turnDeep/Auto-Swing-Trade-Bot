@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def run_daily_ml_pipeline():
-    logger.info("Starting daily ML optimization pipeline (60-day PCA framework)...")
+    logger.info("Starting daily ML optimization pipeline (60-day Ex-Ante Feature framework)...")
     try:
         # Run the ML pipeline script to generate the new Top 10 list based on today's close
         subprocess.run(['python', 'ml_pipeline_60d.py'], check=True)
@@ -28,7 +28,7 @@ def run_daily_trading_bot():
         
     try:
         # Run the daily trading execution script
-        # This script should connect to Webull, wait for 9:35 AM trigger, execute the SINGLE best trade, and stop out at 15:55.
+        # This script connects to Webull Execution but reads FMP Quotes.
         subprocess.run(['python', 'webull_live_trader.py'], check=True)
     except Exception as e:
         logger.error(f"Daily trading bot error: {e}")
