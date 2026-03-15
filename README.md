@@ -176,6 +176,7 @@ python master_scheduler.py
 
 Default schedule:
 
+- startup bootstrap: runs the nightly pipeline once only if the SQLite + Parquet artifacts are missing or incomplete
 - `17:00 America/New_York`: nightly pipeline
 - `09:25 America/New_York`: live trader bootstrap
 

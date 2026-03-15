@@ -176,6 +176,7 @@ python master_scheduler.py
 
 デフォルトのスケジュール:
 
+- 起動時 bootstrap: SQLite + Parquet の必須 artifact が不足している場合だけ nightly pipeline を1回実行
 - `17:00 America/New_York`: nightly pipeline
 - `09:25 America/New_York`: live trader bootstrap
 
