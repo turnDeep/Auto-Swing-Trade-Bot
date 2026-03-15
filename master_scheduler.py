@@ -1,17 +1,22 @@
-import schedule
-import time
 import datetime
-import pytz
-import os
-import subprocess
 import logging
-import json
+import os
+import sqlite3
+import subprocess
 import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+import pytz
+import schedule
+
+from stallion.config import load_settings
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WATCHLIST_PATH = os.path.join(SCRIPT_DIR, "top_10_watchlist.json")
+MODEL_FILENAME = "hist_gbm_extended_5m_start.pkl"
 
 
 def run_python_script(script_name):
@@ -39,26 +44,67 @@ def run_daily_trading_bot():
         logger.error(f"Daily trading bot error: {e}")
 
 
-def watchlist_missing_or_empty():
-    if not os.path.exists(WATCHLIST_PATH):
-        return True
+def _sqlite_table_has_rows(sqlite_path: Path, table_name: str) -> bool:
+    if not sqlite_path.exists():
+        return False
+    try:
+        with sqlite3.connect(sqlite_path) as connection:
+            cursor = connection.execute(f"SELECT 1 FROM {table_name} LIMIT 1")
+            return cursor.fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def _parquet_has_rows(path: Path) -> bool:
+    if not path.exists():
+        return False
 
     try:
-        with open(WATCHLIST_PATH, "r", encoding="utf-8") as handle:
-            watchlist = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return True
+        frame = pd.read_parquet(path)
+    except Exception:
+        return False
 
-    return not isinstance(watchlist, list) or len(watchlist) == 0
+    return not frame.empty
+
+
+def bootstrap_artifacts_ready() -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+
+    try:
+        settings = load_settings(SCRIPT_DIR)
+    except Exception as exc:
+        return False, [f"settings unavailable: {exc}"]
+
+    required_files = {
+        "sqlite database": settings.paths.sqlite_path,
+        "shortlist parquet": settings.paths.watchlist_path,
+        "model artifact": settings.paths.model_dir / MODEL_FILENAME,
+    }
+    for label, path in required_files.items():
+        if not path.exists():
+            reasons.append(f"missing {label} at {path}")
+
+    if settings.paths.watchlist_path.exists() and not _parquet_has_rows(settings.paths.watchlist_path):
+        reasons.append(f"empty shortlist parquet at {settings.paths.watchlist_path}")
+
+    required_tables = ("universe", "daily_features", "nightly_shortlist", "model_registry")
+    for table_name in required_tables:
+        if not _sqlite_table_has_rows(settings.paths.sqlite_path, table_name):
+            reasons.append(f"sqlite table {table_name} is missing or empty")
+
+    return len(reasons) == 0, reasons
 
 
 def run_startup_pipeline_if_needed():
-    if watchlist_missing_or_empty():
-        logger.info("No startup shortlist detected. Running one-shot nightly pipeline bootstrap now...")
+    ready, reasons = bootstrap_artifacts_ready()
+    if not ready:
+        logger.info("Bootstrap artifacts missing or incomplete. Running one-shot nightly pipeline bootstrap now...")
+        for reason in reasons:
+            logger.info("Bootstrap check: %s", reason)
         run_daily_ml_pipeline()
         return
 
-    logger.info("Existing watchlist detected. Skipping startup pipeline bootstrap.")
+    logger.info("SQLite + Parquet bootstrap artifacts detected. Skipping startup pipeline bootstrap.")
 
 def main():
     logger.info("Starting Master Scheduler. Timezone is set to America/New_York.")
