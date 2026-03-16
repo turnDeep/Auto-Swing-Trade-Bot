@@ -48,14 +48,11 @@ It works like this:
 4. if several names appear at the same timestamp, sort by **score descending**
 5. fill until **4 positions** are used
 
-### Shortlist modes
+### Shortlist construction
 
-- `watchlist_model`
-  - default
-  - learns the stage-1 top-400 watchlist from the 7 daily features
-- `legacy`
-  - fallback mode
-  - uses the original hand-weighted shortlist formula
+- runtime shortlist generation is now **always** the learned stage-1 watchlist model
+- the old hand-weighted shortlist is retained only inside the nightly OOS comparison report
+- the live trader and backtester consume the learned top-400 shortlist artifact
 
 ### Exit
 
@@ -191,7 +188,7 @@ What it does:
 3. compute daily feature history
 4. build the intraday training panel
 5. train the HistGBM model
-6. train the nightly watchlist model and write OOS comparison reports
+6. train the nightly watchlist model and write OOS comparison reports against the old hand-crafted shortlist
 7. save the watchlist artifact plus the stage-2 HistGBM artifact
 8. build the next-session shortlist
 

@@ -741,7 +741,7 @@ def write_watchlist_reports(report_dir: Path, cv_outputs: dict[str, pd.DataFrame
         "## Notes",
         "",
         "- Default label uses next-session open-drive rows and existing stage-2 accounting.",
-        "- Legacy shortlist remains available as fallback.",
+        "- Legacy shortlist is retained only for OOS comparison and no longer drives runtime selection.",
     ]
     md_path = report_dir / "watchlist_model_report.md"
     md_path.write_text("\n".join(lines), encoding="utf-8")

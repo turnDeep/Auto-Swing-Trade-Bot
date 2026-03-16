@@ -23,7 +23,6 @@ class CostConfig:
 class RuntimeConfig:
     market_timezone: str = "America/New_York"
     top_n_universe: int = 3000
-    shortlist_mode: str = "watchlist_model"
     shortlist_count: int = 400
     monitor_count: int = 500
     daily_history_days: int = 400
