@@ -244,6 +244,8 @@ def build_watchlist_training_panel(daily_features: pd.DataFrame, watchlist_label
             on=["feature_date", "next_session_date", "symbol"],
             how="left",
         )
+    frame["has_intraday_label_coverage"] = frame.get("label_watchlist_trade_any", pd.Series(index=frame.index, dtype="float64")).notna().astype("int8")
+    frame["has_close_label_coverage"] = frame.get("label_watchlist_nextday_close_up", pd.Series(index=frame.index, dtype="float64")).notna().astype("int8")
     for label_column in LABEL_COLUMN_BY_MODE.values():
         if label_column not in frame.columns:
             frame[label_column] = 0
@@ -255,6 +257,16 @@ def build_watchlist_training_panel(daily_features: pd.DataFrame, watchlist_label
     frame["best_intraday_signal_return"] = frame["best_intraday_signal_return"].fillna(0.0)
     frame["signal_row_count"] = frame["signal_row_count"].fillna(0).astype("int32")
     return frame.sort_values(["feature_date", "symbol"]).reset_index(drop=True)
+
+
+def filter_watchlist_training_panel_for_label_mode(frame: pd.DataFrame, label_mode: str) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    if label_mode in {"trade_and_profit", "trade_any"}:
+        return frame.loc[frame["has_intraday_label_coverage"].eq(1)].copy()
+    if label_mode == "nextday_close_up":
+        return frame.loc[frame["has_close_label_coverage"].eq(1)].copy()
+    return frame.copy()
 
 
 def _cross_sectional_zscore(frame: pd.DataFrame, feature_columns: tuple[str, ...], date_column: str = "feature_date") -> pd.DataFrame:
@@ -309,7 +321,8 @@ def _transform_with_preprocessor(
 
 def train_watchlist_model(train_frame: pd.DataFrame, spec: WatchlistModelSpec) -> tuple[LogisticRegression, WatchlistModelBundle]:
     label_column = LABEL_COLUMN_BY_MODE[spec.label_mode]
-    frame = train_frame.dropna(subset=["feature_date", "symbol", label_column]).copy()
+    frame = filter_watchlist_training_panel_for_label_mode(train_frame, spec.label_mode)
+    frame = frame.dropna(subset=["feature_date", "symbol", label_column]).copy()
     if frame.empty:
         raise ValueError("Watchlist training frame is empty.")
     y_train = frame[label_column].astype(int)
@@ -589,6 +602,7 @@ def evaluate_watchlist_model_cv(
     spec: WatchlistModelSpec,
 ) -> dict[str, pd.DataFrame | dict[str, float]]:
     label_column = LABEL_COLUMN_BY_MODE[spec.label_mode]
+    training_panel = filter_watchlist_training_panel_for_label_mode(training_panel, spec.label_mode)
     dates = _sorted_unique_sessions(training_panel, "feature_date")
     splits = _iter_purged_walk_forward_dates(
         dates,
