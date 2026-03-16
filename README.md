@@ -279,6 +279,5 @@ The container uses `master_scheduler.py` as the entrypoint and now includes a Do
 
 ## Notes
 
-- This repository is now oriented around the **standard daytrade live architecture**, not the old ORB Top-10 system.
 - The current live engine is intentionally simple and transparent.
 - If you want stricter market-regime blocking, crash-day filters, or a websocket collector, those can be layered on top of this base cleanly.
