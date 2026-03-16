@@ -17,6 +17,7 @@ from .watchlist_model import (
     build_stage2_intraday_panel,
     build_watchlist_training_panel,
     evaluate_watchlist_model_cv,
+    extract_watchlist_feature_frame,
     make_watchlist_labels,
     make_watchlist_model_spec,
     save_watchlist_model,
@@ -118,8 +119,9 @@ def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
             "report_path": str(watchlist_report_paths.get("watchlist_model_report.md", "")),
         },
     )
+    latest_watchlist_frame = extract_watchlist_feature_frame(daily_features)
     latest_watchlist_frame = (
-        daily_features.loc[pd.to_datetime(daily_features["session_date"]).eq(latest_date), ["session_date", "symbol", *watchlist_spec.feature_columns]]
+        latest_watchlist_frame.loc[pd.to_datetime(latest_watchlist_frame["session_date"]).eq(latest_date)]
         .rename(columns={"session_date": "feature_date"})
         .copy()
     )

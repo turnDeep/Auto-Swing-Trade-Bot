@@ -29,6 +29,16 @@ WATCHLIST_FEATURE_COLUMNS = [
     "industry_rs_prev",
 ]
 
+WATCHLIST_FEATURE_SOURCE_COLUMNS = {
+    "daily_buy_pressure_prev": "daily_buy_pressure_eod",
+    "daily_rs_score_prev": "daily_rs_score_eod",
+    "daily_rrs_prev": "daily_rrs_eod",
+    "prev_day_adr_pct": "adr_pct_20_eod",
+    "industry_buy_pressure_prev": "industry_buy_pressure_eod",
+    "sector_buy_pressure_prev": "sector_buy_pressure_eod",
+    "industry_rs_prev": "industry_rs_eod",
+}
+
 LABEL_COLUMN_BY_MODE = {
     "trade_and_profit": "label_watchlist_trade_and_profit",
     "trade_any": "label_watchlist_trade_any",
@@ -100,8 +110,9 @@ def make_watchlist_model_spec(settings) -> WatchlistModelSpec:
 
 
 def build_legacy_watchlist(daily_features: pd.DataFrame, session_date: pd.Timestamp, shortlist_count: int) -> pd.DataFrame:
+    feature_frame = extract_watchlist_feature_frame(daily_features)
     target_session = _normalize_date_series([session_date]).iloc[0]
-    latest = daily_features.loc[_normalize_date_series(daily_features["session_date"]).eq(target_session)].copy()
+    latest = feature_frame.loc[_normalize_date_series(feature_frame["session_date"]).eq(target_session)].copy()
     if latest.empty:
         return latest
     latest["shortlist_score"] = 0.0
@@ -127,6 +138,17 @@ def _build_session_map(daily_features: pd.DataFrame) -> pd.DataFrame:
             "next_session_date": _normalize_date_series(sessions[1:]),
         }
     )
+
+
+def extract_watchlist_feature_frame(daily_features: pd.DataFrame) -> pd.DataFrame:
+    if daily_features.empty:
+        return pd.DataFrame(columns=["session_date", "symbol", *WATCHLIST_FEATURE_COLUMNS])
+    source_columns = ["session_date", "symbol", *WATCHLIST_FEATURE_SOURCE_COLUMNS.values()]
+    frame = daily_features[source_columns].copy()
+    rename_map = {source: target for target, source in WATCHLIST_FEATURE_SOURCE_COLUMNS.items()}
+    frame = frame.rename(columns=rename_map)
+    frame["session_date"] = _normalize_date_series(frame["session_date"])
+    return frame
 
 
 def build_stage2_intraday_panel(intraday_bars: pd.DataFrame, daily_features: pd.DataFrame, settings) -> pd.DataFrame:
@@ -212,7 +234,7 @@ def build_watchlist_training_panel(daily_features: pd.DataFrame, watchlist_label
     if session_map.empty:
         return pd.DataFrame()
 
-    frame = daily_features[["session_date", "symbol", *WATCHLIST_FEATURE_COLUMNS]].copy()
+    frame = extract_watchlist_feature_frame(daily_features)
     frame = frame.rename(columns={"session_date": "feature_date"})
     frame["feature_date"] = _normalize_date_series(frame["feature_date"])
     frame = frame.merge(session_map, on="feature_date", how="inner")
@@ -740,6 +762,7 @@ def write_watchlist_reports(report_dir: Path, cv_outputs: dict[str, pd.DataFrame
         "",
         "## Notes",
         "",
+        "- The 7 watchlist features are sourced from same-day EOD values at feature_date close.",
         "- Default label uses next-session open-drive rows and existing stage-2 accounting.",
         "- Legacy shortlist is retained only for OOS comparison and no longer drives runtime selection.",
     ]

@@ -108,8 +108,18 @@ def build_daily_feature_history(daily_bars: pd.DataFrame, universe: pd.DataFrame
     industry_rs_daily["industry_rs_prev"] = industry_rs_daily.groupby("industry", observed=True)["industry_rs"].shift(1)
 
     features = features.merge(
+        sector_daily[["session_date", "sector", "sector_buy_pressure"]],
+        on=["session_date", "sector"],
+        how="left",
+    )
+    features = features.merge(
         sector_daily[["session_date", "sector", "sector_buy_pressure_prev"]],
         on=["session_date", "sector"],
+        how="left",
+    )
+    features = features.merge(
+        industry_bp_daily[["session_date", "industry", "industry_buy_pressure"]],
+        on=["session_date", "industry"],
         how="left",
     )
     features = features.merge(
@@ -118,10 +128,23 @@ def build_daily_feature_history(daily_bars: pd.DataFrame, universe: pd.DataFrame
         how="left",
     )
     features = features.merge(
+        industry_rs_daily[["session_date", "industry", "industry_rs"]],
+        on=["session_date", "industry"],
+        how="left",
+    )
+    features = features.merge(
         industry_rs_daily[["session_date", "industry", "industry_rs_prev"]],
         on=["session_date", "industry"],
         how="left",
     )
+
+    features["daily_buy_pressure_eod"] = features["buy_pressure_20"]
+    features["adr_pct_20_eod"] = features["adr_pct_20"]
+    features["daily_rrs_eod"] = features["daily_rrs"]
+    features["daily_rs_score_eod"] = features["daily_rs_score"]
+    features["sector_buy_pressure_eod"] = features["sector_buy_pressure"]
+    features["industry_buy_pressure_eod"] = features["industry_buy_pressure"]
+    features["industry_rs_eod"] = features["industry_rs"]
 
     features["daily_buy_pressure_prev"] = features.groupby("symbol", sort=False)["buy_pressure_20"].shift(1)
     features["prev_day_adr_pct"] = features.groupby("symbol", sort=False)["adr_pct_20"].shift(1)
@@ -133,6 +156,13 @@ def build_daily_feature_history(daily_bars: pd.DataFrame, universe: pd.DataFrame
     output_columns = [
         "session_date",
         "symbol",
+        "daily_buy_pressure_eod",
+        "adr_pct_20_eod",
+        "industry_buy_pressure_eod",
+        "sector_buy_pressure_eod",
+        "daily_rrs_eod",
+        "daily_rs_score_eod",
+        "industry_rs_eod",
         "daily_buy_pressure_prev",
         "prev_day_adr_pct",
         "industry_buy_pressure_prev",
