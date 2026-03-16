@@ -6,6 +6,7 @@ Stallion-System-Trade is now a **two-stage live-trading scaffold for the standar
 
 - night-before refresh of the **top 3000 U.S. stocks by market cap**
 - stage-1 nightly **watchlist model** on 7 daily features to select the next-session top 400 shortlist
+- the stage-1 watchlist model is built from **same-day EOD daily features at the latest completed close**
 - daily context computed on **252+ trading days of split-adjusted daily bars**
 - intraday monitoring on **5-minute bars**
 - 15-minute context derived from the 5-minute stream
@@ -99,6 +100,8 @@ The deployed feature set is:
 16. `prev_day_close_vs_sma50`
 
 ## 7 Watchlist Features
+
+These are scored from the **latest completed session close (`t`)** to build the shortlist for the next business session (`t+1`).
 
 1. `daily_buy_pressure_prev`
 2. `daily_rs_score_prev`
