@@ -28,6 +28,7 @@ class RuntimeConfig:
     daily_history_days: int = 400
     intraday_history_sessions: int = 40
     same_slot_lookback_sessions: int = 20
+    stage2_symbol_chunk_size: int = 100
     training_sessions: int = 60
     watchlist_label_mode: str = "trade_and_profit"
     watchlist_cv_folds: int = 5

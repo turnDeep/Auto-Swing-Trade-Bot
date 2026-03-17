@@ -13,6 +13,7 @@ from .modeling import fit_hist_gbm, save_model_bundle
 from .storage import SQLiteParquetStore
 from .strategy import StandardSystemSpec
 from .watchlist_model import (
+    _normalize_date_series,
     build_next_session_watchlist,
     build_stage2_intraday_panel,
     build_watchlist_training_panel,
@@ -33,7 +34,10 @@ LOGGER = logging.getLogger(__name__)
 def _latest_session_date(feature_frame: pd.DataFrame) -> pd.Timestamp:
     if feature_frame.empty:
         raise ValueError("No daily feature rows available.")
-    return pd.to_datetime(feature_frame["session_date"]).max().normalize()
+    normalized = _normalize_date_series(feature_frame["session_date"]).dropna()
+    if normalized.empty:
+        raise ValueError("No valid daily feature session dates available.")
+    return pd.Timestamp(normalized.max()).normalize()
 
 
 def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
@@ -121,11 +125,11 @@ def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
     )
     latest_watchlist_frame = extract_watchlist_feature_frame(daily_features)
     latest_watchlist_frame = (
-        latest_watchlist_frame.loc[pd.to_datetime(latest_watchlist_frame["session_date"]).eq(latest_date)]
+        latest_watchlist_frame.loc[_normalize_date_series(latest_watchlist_frame["session_date"]).eq(latest_date)]
         .rename(columns={"session_date": "feature_date"})
         .copy()
     )
-    latest_watchlist_frame["feature_date"] = pd.to_datetime(latest_watchlist_frame["feature_date"]).dt.normalize()
+    latest_watchlist_frame["feature_date"] = _normalize_date_series(latest_watchlist_frame["feature_date"])
     scored_watchlist = score_watchlist_universe(watchlist_model, watchlist_bundle, latest_watchlist_frame)
     shortlist = build_next_session_watchlist(scored_watchlist, settings.runtime.shortlist_count)
     shortlist["session_date"] = latest_date
