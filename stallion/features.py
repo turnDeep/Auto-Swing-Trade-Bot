@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import gc
+import logging
 import math
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 from .strategy import STANDARD_FEATURE_COLUMNS, session_bucket_from_minutes
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
@@ -186,11 +193,18 @@ def build_intraday_feature_panel(
     intraday_bars: pd.DataFrame,
     daily_features: pd.DataFrame,
     same_slot_lookback_sessions: int = 20,
+    symbol_chunk_size: int = 100,
+    allowed_session_buckets: tuple[str, ...] | None = None,
+    min_minutes_from_open: int | None = None,
+    max_minutes_from_open: int | None = None,
+    parquet_spill_dir: str | Path | None = None,
 ) -> pd.DataFrame:
     if intraday_bars.empty or daily_features.empty:
         return pd.DataFrame(columns=["timestamp", "session_date", "symbol", "minutes_from_open", "session_bucket", *STANDARD_FEATURE_COLUMNS])
 
     work = intraday_bars.copy()
+    keep_columns = ["symbol", "ts", "open", "high", "low", "close", "volume"]
+    work = work[[column for column in keep_columns if column in work.columns]].copy()
     work["timestamp"] = pd.to_datetime(work["ts"], utc=True, errors="coerce").dt.tz_convert("America/New_York")
     work = work.dropna(subset=["timestamp"]).sort_values(["symbol", "timestamp"]).reset_index(drop=True)
     work["session_date"] = work["timestamp"].dt.normalize()
@@ -200,9 +214,35 @@ def build_intraday_feature_panel(
     work["slot_index"] = (work["minutes_from_open"] // 5).astype("int16")
     work["session_bucket"] = session_bucket_from_minutes(work["minutes_from_open"])
 
-    same_slot_rows: list[pd.DataFrame] = []
-    session_rows: list[pd.DataFrame] = []
-    for symbol, frame in work.groupby("symbol", sort=False):
+    daily_lookup_columns = [
+        "symbol",
+        "session_date",
+        "daily_buy_pressure_prev",
+        "prev_day_adr_pct",
+        "industry_buy_pressure_prev",
+        "sector_buy_pressure_prev",
+        "daily_rrs_prev",
+        "daily_rs_score_prev",
+        "distance_to_avwap_63_prev",
+        "industry_rs_prev",
+        "prev_day_close_vs_sma50",
+        "prev_day_high",
+        "prev_day_atr14",
+    ]
+    daily = daily_features[daily_lookup_columns].copy()
+    daily["session_date"] = pd.to_datetime(daily["session_date"]).dt.normalize()
+
+    def _downcast_frame(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        work_frame = frame.copy()
+        for column in work_frame.select_dtypes(include=["float64"]).columns:
+            work_frame[column] = pd.to_numeric(work_frame[column], downcast="float")
+        for column in work_frame.select_dtypes(include=["int64", "int32"]).columns:
+            work_frame[column] = pd.to_numeric(work_frame[column], downcast="integer")
+        return work_frame
+
+    def _build_symbol_frame(frame: pd.DataFrame) -> pd.DataFrame:
         frame = frame.sort_values("timestamp").copy()
         date_group = frame.groupby("session_date", sort=False)
         frame["session_high_so_far"] = date_group["high"].cummax()
@@ -218,50 +258,119 @@ def build_intraday_feature_panel(
         boundary_mask = (frame["minutes_from_open"] % 15 == 0) & (frame["minutes_from_open"] >= 15)
         frame["close_vs_vwap_15"] = np.nan
         frame.loc[boundary_mask, "close_vs_vwap_15"] = (frame.loc[boundary_mask, "close"] / frame.loc[boundary_mask, "session_vwap"]) - 1.0
-        frame["close_vs_vwap_15"] = date_group["close_vs_vwap_15"].ffill()
+        frame["close_vs_vwap_15"] = frame.groupby("session_date", sort=False)["close_vs_vwap_15"].ffill()
 
         fifteen = frame.loc[boundary_mask, ["timestamp", "close"]].copy()
         fifteen["EMA_8_15"] = _ema(fifteen["close"], 8)
         frame = frame.merge(fifteen[["timestamp", "EMA_8_15"]], on="timestamp", how="left")
-        frame["EMA_8_15"] = frame["EMA_8_15"].ffill()
+        frame["EMA_8_15"] = frame.groupby("session_date", sort=False)["EMA_8_15"].ffill()
 
-        per_slot = frame[["symbol", "session_date", "slot_index", "volume"]].copy()
-        per_slot["same_slot_avg_vol_20d"] = (
-            per_slot.groupby(["symbol", "slot_index"], sort=False)["volume"]
+        frame["same_slot_avg_vol_20d"] = (
+            frame.groupby("slot_index", sort=False)["volume"]
             .transform(lambda s: s.shift(1).rolling(same_slot_lookback_sessions, min_periods=5).mean())
-        )
-        frame = frame.merge(
-            per_slot[["symbol", "session_date", "slot_index", "same_slot_avg_vol_20d"]],
-            on=["symbol", "session_date", "slot_index"],
-            how="left",
         )
         frame["intraday_rvol"] = frame["volume"] / frame["same_slot_avg_vol_20d"].replace(0, np.nan)
         frame["volume_spike_5m"] = frame["intraday_rvol"] - 1.0
-        same_slot_rows.append(frame)
+        if allowed_session_buckets:
+            frame = frame.loc[frame["session_bucket"].isin(allowed_session_buckets)].copy()
+        if min_minutes_from_open is not None:
+            frame = frame.loc[frame["minutes_from_open"] >= min_minutes_from_open].copy()
+        if max_minutes_from_open is not None:
+            frame = frame.loc[frame["minutes_from_open"] <= max_minutes_from_open].copy()
+        return frame[
+            [
+                "timestamp",
+                "session_date",
+                "symbol",
+                "minutes_from_open",
+                "session_bucket",
+                "EMA_8_15",
+                "close_vs_vwap_15",
+                "same_slot_avg_vol_20d",
+                "intraday_rvol",
+                "volume_spike_5m",
+                "session_high_so_far",
+                "session_low_so_far",
+                "next_open",
+                "next_timestamp",
+                "session_close",
+                "close",
+            ]
+        ].copy()
 
-    panel = pd.concat(same_slot_rows, ignore_index=True)
-    daily = daily_features.copy()
-    daily["session_date"] = pd.to_datetime(daily["session_date"]).dt.normalize()
-    panel = panel.merge(daily, on=["symbol", "session_date"], how="left")
-    panel["distance_to_prev_day_high"] = (panel["close"] / panel["prev_day_high"]) - 1.0
-    panel["rs_x_intraday_rvol"] = panel["daily_rs_score_prev"] * panel["intraday_rvol"]
-    panel["intraday_range_expansion_vs_atr"] = (panel["session_high_so_far"] - panel["session_low_so_far"]) / panel["prev_day_atr14"].replace(0, np.nan)
-    panel["timestamp"] = pd.to_datetime(panel["timestamp"], utc=False)
+    def _finalize_chunk(chunk_frames: list[pd.DataFrame], chunk_symbols: list[str]) -> pd.DataFrame:
+        if not chunk_frames:
+            return pd.DataFrame()
+        panel = pd.concat(chunk_frames, ignore_index=True)
+        daily_chunk = daily.loc[daily["symbol"].isin(chunk_symbols)].copy()
+        panel = panel.merge(daily_chunk, on=["symbol", "session_date"], how="left")
+        panel["distance_to_prev_day_high"] = (panel["close"] / panel["prev_day_high"]) - 1.0
+        panel["rs_x_intraday_rvol"] = panel["daily_rs_score_prev"] * panel["intraday_rvol"]
+        panel["intraday_range_expansion_vs_atr"] = (panel["session_high_so_far"] - panel["session_low_so_far"]) / panel["prev_day_atr14"].replace(0, np.nan)
+        panel["timestamp"] = pd.to_datetime(panel["timestamp"], utc=False)
+        panel = panel[
+            [
+                "timestamp",
+                "session_date",
+                "symbol",
+                "minutes_from_open",
+                "session_bucket",
+                *STANDARD_FEATURE_COLUMNS,
+                "next_open",
+                "next_timestamp",
+                "session_close",
+                "close",
+            ]
+        ].copy()
+        return _downcast_frame(panel)
 
-    return panel[
-        [
-            "timestamp",
-            "session_date",
-            "symbol",
-            "minutes_from_open",
-            "session_bucket",
-            *STANDARD_FEATURE_COLUMNS,
-            "next_open",
-            "next_timestamp",
-            "session_close",
-            "close",
-        ]
-    ].copy()
+    spill_paths: list[Path] = []
+    collected_chunks: list[pd.DataFrame] = []
+    chunk_frames: list[pd.DataFrame] = []
+    chunk_symbols: list[str] = []
+    spill_root = Path(parquet_spill_dir) if parquet_spill_dir is not None else None
+    if spill_root is not None:
+        spill_root.mkdir(parents=True, exist_ok=True)
+
+    chunk_index = 0
+    for symbol, symbol_frame in work.groupby("symbol", sort=False, observed=True):
+        processed = _build_symbol_frame(symbol_frame)
+        if not processed.empty:
+            chunk_frames.append(processed)
+            chunk_symbols.append(str(symbol))
+        if len(chunk_symbols) < max(1, int(symbol_chunk_size)):
+            continue
+        finalized = _finalize_chunk(chunk_frames, chunk_symbols)
+        if not finalized.empty:
+            if spill_root is not None:
+                path = spill_root / f"intraday_feature_chunk_{chunk_index:04d}.parquet"
+                finalized.to_parquet(path, index=False)
+                spill_paths.append(path)
+            else:
+                collected_chunks.append(finalized)
+        chunk_index += 1
+        chunk_frames.clear()
+        chunk_symbols.clear()
+        gc.collect()
+        if chunk_index % 5 == 0:
+            LOGGER.info("Built %s intraday feature chunks", chunk_index)
+
+    if chunk_symbols:
+        finalized = _finalize_chunk(chunk_frames, chunk_symbols)
+        if not finalized.empty:
+            if spill_root is not None:
+                path = spill_root / f"intraday_feature_chunk_{chunk_index:04d}.parquet"
+                finalized.to_parquet(path, index=False)
+                spill_paths.append(path)
+            else:
+                collected_chunks.append(finalized)
+        gc.collect()
+
+    if spill_paths:
+        return pd.concat((pd.read_parquet(path) for path in spill_paths), ignore_index=True)
+    if collected_chunks:
+        return pd.concat(collected_chunks, ignore_index=True)
+    return pd.DataFrame(columns=["timestamp", "session_date", "symbol", "minutes_from_open", "session_bucket", *STANDARD_FEATURE_COLUMNS])
 
 
 def build_training_labels(feature_panel: pd.DataFrame, commission_rate_one_way: float, slippage_bps_per_side: float, spread_bps_round_trip: float, adverse_fill_floor: float, adverse_fill_cap: float) -> pd.DataFrame:
@@ -281,3 +390,85 @@ def build_training_labels(feature_panel: pd.DataFrame, commission_rate_one_way: 
     work["net_return_stress_exec"] = ((exit_fill * (1.0 - commission_rate_one_way)) / (entry_fill * (1.0 + commission_rate_one_way))) - 1.0
     work["label_stress_exec"] = (work["net_return_stress_exec"] > 0).astype("int8")
     return work
+
+
+def build_stage2_labeled_panel(
+    intraday_bars: pd.DataFrame,
+    daily_features: pd.DataFrame,
+    same_slot_lookback_sessions: int,
+    min_minutes_from_open: int,
+    max_minutes_from_open: int,
+    commission_rate_one_way: float,
+    slippage_bps_per_side: float,
+    spread_bps_round_trip: float,
+    adverse_fill_floor: float,
+    adverse_fill_cap: float,
+    symbol_chunk_size: int = 100,
+    spill_parent_dir: str | Path | None = None,
+) -> pd.DataFrame:
+    empty_columns = [
+        "timestamp",
+        "session_date",
+        "symbol",
+        "minutes_from_open",
+        "session_bucket",
+        *STANDARD_FEATURE_COLUMNS,
+        "next_open",
+        "next_timestamp",
+        "session_close",
+        "close",
+        "net_return_stress_exec",
+        "label_stress_exec",
+    ]
+    if intraday_bars.empty or daily_features.empty:
+        return pd.DataFrame(columns=empty_columns)
+
+    temp_root = Path(spill_parent_dir) if spill_parent_dir is not None else None
+    if temp_root is not None:
+        temp_root.mkdir(parents=True, exist_ok=True)
+
+    with TemporaryDirectory(dir=temp_root) as temp_dir_name:
+        feature_spill_dir = Path(temp_dir_name) / "feature_chunks"
+        label_spill_dir = Path(temp_dir_name) / "label_chunks"
+        feature_spill_dir.mkdir(parents=True, exist_ok=True)
+        label_spill_dir.mkdir(parents=True, exist_ok=True)
+
+        _ = build_intraday_feature_panel(
+            intraday_bars,
+            daily_features,
+            same_slot_lookback_sessions=same_slot_lookback_sessions,
+            symbol_chunk_size=symbol_chunk_size,
+            allowed_session_buckets=("open_drive",),
+            min_minutes_from_open=min_minutes_from_open,
+            max_minutes_from_open=max_minutes_from_open,
+            parquet_spill_dir=feature_spill_dir,
+        )
+
+        label_paths: list[Path] = []
+        for chunk_index, feature_path in enumerate(sorted(feature_spill_dir.glob("intraday_feature_chunk_*.parquet"))):
+            feature_chunk = pd.read_parquet(feature_path)
+            labeled_chunk = build_training_labels(
+                feature_chunk,
+                commission_rate_one_way=commission_rate_one_way,
+                slippage_bps_per_side=slippage_bps_per_side,
+                spread_bps_round_trip=spread_bps_round_trip,
+                adverse_fill_floor=adverse_fill_floor,
+                adverse_fill_cap=adverse_fill_cap,
+            ).dropna(subset=["next_open", "session_close"])
+            if labeled_chunk.empty:
+                continue
+            label_path = label_spill_dir / f"labeled_chunk_{chunk_index:04d}.parquet"
+            for column in labeled_chunk.select_dtypes(include=["float64"]).columns:
+                labeled_chunk[column] = pd.to_numeric(labeled_chunk[column], downcast="float")
+            for column in labeled_chunk.select_dtypes(include=["int64", "int32"]).columns:
+                labeled_chunk[column] = pd.to_numeric(labeled_chunk[column], downcast="integer")
+            labeled_chunk.to_parquet(label_path, index=False)
+            label_paths.append(label_path)
+            del feature_chunk, labeled_chunk
+            gc.collect()
+            if (chunk_index + 1) % 5 == 0:
+                LOGGER.info("Built %s labeled intraday chunks", chunk_index + 1)
+
+        if not label_paths:
+            return pd.DataFrame(columns=empty_columns)
+        return pd.concat((pd.read_parquet(path) for path in label_paths), ignore_index=True)

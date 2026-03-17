@@ -12,7 +12,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
-from .features import build_intraday_feature_panel, build_training_labels
+from .features import build_stage2_labeled_panel
 from .modeling import fit_hist_gbm, score_candidates
 from .strategy import StandardSystemSpec, select_candidates_for_session
 
@@ -152,30 +152,20 @@ def extract_watchlist_feature_frame(daily_features: pd.DataFrame) -> pd.DataFram
 
 
 def build_stage2_intraday_panel(intraday_bars: pd.DataFrame, daily_features: pd.DataFrame, settings) -> pd.DataFrame:
-    spec = StandardSystemSpec(
-        min_minutes_from_open=settings.runtime.min_minutes_from_open,
-        max_minutes_from_open=settings.runtime.max_minutes_from_open,
-        max_positions=settings.runtime.max_positions,
-        threshold_floor=settings.runtime.threshold_floor,
-        threshold_quantile=settings.runtime.threshold_quantile,
-    )
-    panel = build_intraday_feature_panel(
+    return build_stage2_labeled_panel(
         intraday_bars,
         daily_features,
         same_slot_lookback_sessions=settings.runtime.same_slot_lookback_sessions,
-    )
-    panel = panel[panel["session_bucket"].eq("open_drive")].copy()
-    panel = panel[panel["minutes_from_open"].between(spec.min_minutes_from_open, spec.max_minutes_from_open, inclusive="both")].copy()
-    labeled = build_training_labels(
-        panel,
+        min_minutes_from_open=settings.runtime.min_minutes_from_open,
+        max_minutes_from_open=settings.runtime.max_minutes_from_open,
         commission_rate_one_way=settings.costs.commission_rate_one_way,
         slippage_bps_per_side=settings.costs.slippage_bps_per_side,
         spread_bps_round_trip=settings.costs.spread_bps_round_trip,
         adverse_fill_floor=settings.costs.extra_adverse_fill_floor,
         adverse_fill_cap=settings.costs.extra_adverse_fill_cap,
-    ).dropna(subset=["next_open", "session_close"])
-    labeled["session_date"] = _normalize_date_series(labeled["session_date"])
-    return labeled
+        symbol_chunk_size=settings.runtime.stage2_symbol_chunk_size,
+        spill_parent_dir=settings.paths.parquet_dir / "tmp",
+    )
 
 
 def make_watchlist_labels(daily_features: pd.DataFrame, daily_bars: pd.DataFrame, intraday_labeled: pd.DataFrame) -> pd.DataFrame:
