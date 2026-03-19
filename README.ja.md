@@ -1,215 +1,176 @@
 # Stallion-System-Trade
 
-Language / 言語: [English](./README.md) | **日本語**
+[English](./README.md) | 日本語
 
-Stallion-System-Trade は、 **標準のラッセル3000向けイントラデイ売買ロジックを実運用するための live-trading scaffold** として構成されています。
+Stallion-System-Trade は、米国個別株向けの 2 段階 intraday 売買システムです。
 
-- 前夜に **時価総額上位3000銘柄** を更新
-- **252営業日以上** の split-adjusted 日足から日次コンテキストを計算
-- 場中は **5分足** を監視
-- **15分足コンテキストは 5分足から導出**
-- **16特徴量の `hist_gbm_extended 5m_start` ロジック** でスコアリング
-- **next-bar open でエントリー**, **当日引けでクローズ**, **1セッション最大4ポジション**
-- データ保存は pickle ではなく **SQLite + Parquet**
+- 第1段階: 前日引け後に 7 つの日足特徴量で翌営業日の上位 200 銘柄を選ぶ watchlist モデル
+- 第2段階: shortlist に対して 16 特徴量の intraday モデルで 5 分足ごとにスコアリングし、最大 4 銘柄まで発注
+- 保存形式: SQLite + Parquet
+- Webull 本番認証が不足している場合は自動で DEMO モード
+- Discord 通知で起動状態、注文、約定、クローズサマリーを配信
 
-## 標準ロジック
+## 動作モード
 
-本番システムは、現在の研究コードベースで使っている標準ロジックに合わせています。
+`.env` の内容で自動判定します。
 
-### 売買時間帯
+- `LIVE`
+  - `WEBULL_APP_KEY`
+  - `WEBULL_APP_SECRET`
+  - `WEBULL_ACCOUNT_ID`
+  がすべて揃っている場合のみ
+- `DEMO`
+  - 上記のいずれかが欠けている場合
 
-- シグナル判定ウィンドウ: **米国市場オープン後 5〜90分**
-- 最速の実約定タイミング: **次の5分足の始値**
-- オーバーナイトなし
-- 同一銘柄は1日1回まで
-- 同時保有上限: **4**
+Discord 通知には `[LIVE]` または `[DEMO]` が付きます。
 
-### モデル
+## 売買フロー
 
-- モデル: `HistGradientBoostingClassifier`
-- 特徴量数: **16**
-- 学習ごとの閾値:
+### 第1段階: Nightly watchlist model
 
-```text
-threshold = max(0.55, 90th percentile of train_scores)
-```
-
-### エントリー選抜
-
-このシステムは、後から振り返って「その日の score 上位4銘柄」を選ぶ方式ではありません。
-
-動き方は以下です。
-
-1. 場中に全候補をリアルタイムでスコアリング
-2. `score >= threshold` の銘柄だけ残す
-3. **timestamp 順** に処理する
-4. 同じ timestamp に複数銘柄がある場合は **score 降順**
-5. **4ポジション** 埋まるまで約定する
-
-### エグジット
-
-- 運用上の前提: **当日引けクローズ**
-- バックテスト / live 会計前提:
-  - 手数料: `片道 0.2%`
-  - スリッページ: `片道 5 bps`
-  - スプレッド: `往復 5 bps`
-
-## 16個の live 特徴量
-
-実運用で使う特徴量セットは以下です。
+引け時点 `t` で以下 7 特徴量を使い、翌営業日 `t+1` の shortlist を作ります。
 
 1. `daily_buy_pressure_prev`
-2. `prev_day_adr_pct`
-3. `industry_buy_pressure_prev`
-4. `EMA_8_15`
-5. `distance_to_prev_day_high`
-6. `close_vs_vwap_15`
-7. `sector_buy_pressure_prev`
-8. `daily_rrs_prev`
-9. `daily_rs_score_prev`
-10. `distance_to_avwap_63_prev`
-11. `volume_spike_5m`
-12. `industry_rs_prev`
-13. `same_slot_avg_vol_20d`
-14. `rs_x_intraday_rvol`
-15. `intraday_range_expansion_vs_atr`
-16. `prev_day_close_vs_sma50`
+2. `daily_rs_score_prev`
+3. `daily_rrs_prev`
+4. `prev_day_adr_pct`
+5. `industry_buy_pressure_prev`
+6. `sector_buy_pressure_prev`
+7. `industry_rs_prev`
 
-## 必要データ
+- モデル: `LogisticRegression`
+- 出力: 翌営業日用 top 200 shortlist
 
-### 前夜に全ユニバースで必要なデータ
+### 第2段階: Intraday execution
 
-- 時価総額上位3000銘柄
-- `symbol`, `exchange`, `sector`, `industry`, `market_cap`
-- split-adjusted 日足 OHLCV
-- `SPY` の日足 OHLCV
+- 対象: stage-1 shortlist のみ
+- モデル: `HistGradientBoostingClassifier`
+- 時間足:
+  - 5分足
+  - 5分足から集約した 15 分文脈
+  - 前日までの daily 文脈
+- シグナル時間帯: 米国市場オープン後 5〜90 分
+- エントリー: 次バー始値
+- エグジット: 当日引け前に全決済
+- 最大保有数: 4
 
-### 場中に必要なデータ
+## 注文・スロット管理
 
-- 監視 shortlist の当日5分足 OHLCV
-- 5分足から導出した15分足コンテキスト
+live trader は以下を明示的に区別します。
 
-### ローカルに保持しておく履歴
+- 空き枠
+- 発注済み未約定枠
+- 部分約定枠
+- 完全約定済み保有枠
+- 売却待ち枠
+- reserved buying power
 
-- 日足: **300〜400営業日**
-- 5分足: **20〜40営業日**
-- 同時刻出来高履歴: **20営業日**
+重要:
 
-## ストレージ構成
+- 未約定注文が残っている間は、その枠を空き枠として扱いません
+- 枠を解放するのは以下のいずれかが確認できた後だけです
+  - cancel 完了
+  - rejected
+  - expired
+  - failed
+  - 売却完了かつ保有解消
+- 部分約定は枠を占有したまま維持します
 
-このプロジェクトは次の形で保存します。
+## 買付余力と数量計算
 
-- **SQLite**
-  - ユニバース metadata
-  - 日足バー
-  - 5分足バー
-  - 日次特徴量
-  - shortlist
-  - model registry
-  - live signals / fills
-- **Parquet**
-  - raw daily snapshots
-  - raw intraday snapshots
-  - daily feature snapshots
-  - nightly shortlist snapshots
+- 使用するのは総資産ではなく **買付余力**
+- 当日の開始時点の買付余力を 4 分割してスロット予算にします
+- デフォルトでは整数株で発注します
+- スロット予算が 1 株価格に届かない場合は:
+  - 発注しない
+  - 理由をログと Discord に残す
+- 成行が失敗した場合は:
+  - 設定可能な marketable limit order にフォールバックします
 
-重要な点:
+## Discord 通知
 
-- pickle は本番の主保存形式ではありません
-- Parquet は再現可能な snapshot と研究再利用向けです
-- SQLite は運用時の operational store です
+`DISCORD_BOT_TOKEN` と `DISCORD_CHANNEL_ID` が両方ある場合、以下を送ります。
 
-## 主なファイル
+- scheduler 起動
+- nightly pipeline 開始 / 完了 / 失敗
+- プレマーケット通知
+- 買い発注通知
+- 約定通知
+- cancel 要求通知
+- 市場クローズ時サマリー
 
-| File | Role |
-|---|---|
-| `ml_pipeline_60d.py` | nightly pipeline の入口 |
-| `webull_live_trader.py` | live execution の入口 |
-| `backtester.py` | event-driven backtest の入口 |
-| `master_scheduler.py` | 日次 scheduler |
-| `stallion/config.py` | 実行設定とパス管理 |
-| `stallion/storage.py` | SQLite + Parquet 保存 |
-| `stallion/features.py` | 日足 / イントラデイ特徴量生成 |
-| `stallion/modeling.py` | HistGBM 学習 / スコアリング / 閾値管理 |
-| `stallion/nightly_pipeline.py` | ユニバース更新、特徴量生成、モデル学習、shortlist 作成 |
-| `stallion/live_trader.py` | リアルタイム監視、スコアリング、選抜、注文執行 |
-
-## 実行フロー
-
-### Nightly pipeline
-
-```bash
-python ml_pipeline_60d.py
-```
-
-やること:
-
-1. FMP から top-3000 universe を更新
-2. 日足と5分足のローカル履歴を更新
-3. 日次特徴量履歴を生成
-4. イントラデイ学習 panel を生成
-5. HistGBM モデルを学習
-6. モデル artifact と threshold を保存
-7. 翌営業日の shortlist を作成
-
-### Live trader
-
-```bash
-python webull_live_trader.py
-```
-
-やること:
-
-1. 保存済みモデルと nightly shortlist をロード
-2. 監視銘柄の FMP batch quote を取得
-3. operational 5分足ストアへ集約
-4. 現在時点の intraday 特徴量を再構築
-5. 候補銘柄をスコアリング
-6. 最大4銘柄までリアルタイムで選抜
-7. Webull に注文をルーティング
-
-### Scheduler
-
-```bash
-python master_scheduler.py
-```
-
-デフォルトのスケジュール:
-
-- 起動時 bootstrap: SQLite + Parquet の必須 artifact が不足している場合だけ nightly pipeline を1回実行
-- `17:00 America/New_York`: nightly pipeline
-- `09:25 America/New_York`: live trader bootstrap
+`DISCORD_BOT_TOKEN` だけある場合は token の疎通確認はできますが、実際に送信するには `DISCORD_CHANNEL_ID` も必要です。
 
 ## 環境変数
 
-`.env.example` を元に `.env` を作成してください。
+`.env.example` をコピーして `.env` を作成してください。
 
 ```env
 FMP_API_KEY=
 WEBULL_APP_KEY=
 WEBULL_APP_SECRET=
 WEBULL_ACCOUNT_ID=
+DISCORD_BOT_TOKEN=
+DISCORD_CHANNEL_ID=
 ```
 
-## インストール
+## 主な実行コマンド
+
+Nightly pipeline:
 
 ```bash
-git clone https://github.com/turnDeep/Stallion-System-Trade.git
-cd Stallion-System-Trade
-python -m venv .venv
-.venv\\Scripts\\activate
-pip install -r requirements.txt
+python ml_pipeline_60d.py
 ```
 
-## Docker
+Live trader:
 
 ```bash
-docker compose up -d
+python webull_live_trader.py
 ```
 
-コンテナの entrypoint は引き続き `master_scheduler.py` です。
+Scheduler:
 
-## Notes
+```bash
+python master_scheduler.py
+```
 
-- 現在の live engine は、意図的にシンプルで追いやすい形にしています。
-- より厳しい地合いフィルター、暴落日ブロック、websocket collector などは、この土台の上に追加できます。
+Docker:
+
+```bash
+docker compose up -d --build
+```
+
+初回デプロイ時は履歴取得と特徴量構築のため時間がかかります。以後の再起動では既存の SQLite + Parquet artifact を再利用します。
+
+## Docker メモ
+
+- `/app/data` と `/app/reports` は named volume です
+- 必要 artifact が無いときだけ startup bootstrap を走らせます
+- healthcheck は `stallion.watchdog` を使用します
+
+## 主なファイル
+
+| ファイル | 役割 |
+|---|---|
+| `ml_pipeline_60d.py` | nightly pipeline 入口 |
+| `webull_live_trader.py` | live 実行入口 |
+| `master_scheduler.py` | scheduler と bootstrap |
+| `stallion/config.py` | 設定と DEMO/LIVE 判定 |
+| `stallion/storage.py` | SQLite + Parquet 保存 |
+| `stallion/watchlist_model.py` | stage-1 watchlist 学習 |
+| `stallion/modeling.py` | stage-2 HistGBM 学習 / 推論 |
+| `stallion/live_trader.py` | live の状態管理・発注・通知 |
+| `stallion/broker.py` | Webull JP wrapper / demo broker |
+| `stallion/discord_notifier.py` | 非同期 Discord 通知 |
+| `stallion/slot_manager.py` | スロット状態と reserved buying power |
+
+## 注意
+
+本番利用前に、必ず以下を確認してください。
+
+- Webull JP 口座の API 権限
+- Discord channel 設定
+- ホスト側の時刻と市場時間
+- 初回 bootstrap が完了していること
+
+不安がある場合は、まず DEMO モードで確認してください。

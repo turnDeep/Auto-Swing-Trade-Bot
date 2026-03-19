@@ -74,6 +74,8 @@ class WebullBroker:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.region = Region.JP.value
+        self.mode_label = settings.trade_mode
+        self.is_demo = False
         self._api = API(
             ApiClient(
                 settings.credentials.webull_app_key,
@@ -312,6 +314,36 @@ class WebullBroker:
             "request_symbol": str(symbol).upper(),
             "request_side": side.upper(),
             "request_quantity": int(quantity),
+            "order_type": "MARKET",
+        }
+
+    def place_marketable_limit_order(self, *, symbol: str, side: str, quantity: int, limit_price: float) -> dict[str, Any]:
+        client_order_id = uuid.uuid4().hex
+        new_order = {
+            "client_order_id": client_order_id,
+            "symbol": str(symbol).upper(),
+            "instrument_type": "EQUITY",
+            "market": "US",
+            "order_type": "LIMIT",
+            "limit_price": str(limit_price),
+            "quantity": str(int(quantity)),
+            "support_trading_session": "N",
+            "side": side.upper(),
+            "time_in_force": "DAY",
+            "entrust_type": "QTY",
+            "account_tax_type": "SPECIFIC",
+        }
+        response = self.api.order_v2.place_order(account_id=self.account_id, new_orders=new_order)
+        payload = _safe_json(response)
+        return {
+            "client_order_id": client_order_id,
+            "status_code": getattr(response, "status_code", None),
+            "response_json": payload if payload is not None else str(response),
+            "request_symbol": str(symbol).upper(),
+            "request_side": side.upper(),
+            "request_quantity": int(quantity),
+            "limit_price": float(limit_price),
+            "order_type": "LIMIT",
         }
 
     def cancel_order(self, *, client_order_id: str) -> dict[str, Any]:
@@ -322,3 +354,80 @@ class WebullBroker:
             "status_code": getattr(response, "status_code", None),
             "response_json": payload if payload is not None else str(response),
         }
+
+
+class DemoBroker:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.region = "demo"
+        self.mode_label = settings.trade_mode
+        self.is_demo = True
+
+    def probe(self) -> BrokerProbe:
+        return BrokerProbe(region=self.region, account_list_ok=True, balance_ok=True, positions_ok=True, account_count=1)
+
+    def get_account_list(self) -> list[dict[str, Any]]:
+        return [{"account_id": "DEMO", "mode": "DEMO"}]
+
+    def get_account_balance_raw(self) -> dict[str, Any]:
+        return {"buying_power": self.settings.runtime.demo_starting_buying_power}
+
+    def get_account_buying_power(self) -> float:
+        return float(self.settings.runtime.demo_starting_buying_power)
+
+    def get_account_equity(self) -> float:
+        return float(self.settings.runtime.demo_starting_buying_power)
+
+    def get_positions_df(self) -> pd.DataFrame:
+        return pd.DataFrame(columns=["symbol", "quantity", "available_quantity", "avg_price", "market_value", "payload_json"])
+
+    def get_order_history_df(self, *, lookback_days: int = 7, page_size: int = 100) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "client_order_id",
+                "order_id",
+                "symbol",
+                "side",
+                "status",
+                "quantity",
+                "filled_quantity",
+                "place_time_at",
+                "filled_time_at",
+                "payload_json",
+            ]
+        )
+
+    def place_market_order(self, *, symbol: str, side: str, quantity: int) -> dict[str, Any]:
+        client_order_id = uuid.uuid4().hex
+        return {
+            "client_order_id": client_order_id,
+            "status_code": 200,
+            "response_json": {"demo": True},
+            "request_symbol": str(symbol).upper(),
+            "request_side": side.upper(),
+            "request_quantity": int(quantity),
+            "order_type": "MARKET",
+        }
+
+    def place_marketable_limit_order(self, *, symbol: str, side: str, quantity: int, limit_price: float) -> dict[str, Any]:
+        client_order_id = uuid.uuid4().hex
+        return {
+            "client_order_id": client_order_id,
+            "status_code": 200,
+            "response_json": {"demo": True},
+            "request_symbol": str(symbol).upper(),
+            "request_side": side.upper(),
+            "request_quantity": int(quantity),
+            "limit_price": float(limit_price),
+            "order_type": "LIMIT",
+        }
+
+    def cancel_order(self, *, client_order_id: str) -> dict[str, Any]:
+        return {"client_order_id": client_order_id, "status_code": 200, "response_json": {"demo": True}}
+
+
+def create_broker(settings: Settings) -> WebullBroker | DemoBroker:
+    if settings.demo_mode:
+        LOGGER.warning("Broker mode resolved to DEMO because Webull credentials are missing or incomplete.")
+        return DemoBroker(settings)
+    return WebullBroker(settings)

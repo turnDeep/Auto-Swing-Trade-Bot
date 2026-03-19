@@ -12,6 +12,7 @@ import pytz
 import schedule
 
 from stallion.config import load_settings
+from stallion.discord_notifier import DiscordNotifier
 from stallion.storage import SQLiteParquetStore
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_FILENAME = "hist_gbm_extended_5m_start.pkl"
 STORE = None
+NOTIFIER = None
 
 
 def run_python_script(script_name):
@@ -28,16 +30,24 @@ def run_daily_ml_pipeline():
     if STORE is not None:
         STORE.write_heartbeat("master_scheduler", "running_pipeline", {"job": "nightly_pipeline"})
     logger.info("Starting nightly standard daytrade pipeline...")
+    if NOTIFIER is not None:
+        NOTIFIER.notify("NIGHTLY PIPELINE START", ["- job: nightly_pipeline"])
     try:
         run_python_script('ml_pipeline_60d.py')
         logger.info("Nightly standard pipeline completed successfully. Shortlist and model artifacts updated.")
+        if NOTIFIER is not None:
+            NOTIFIER.notify("NIGHTLY PIPELINE COMPLETE", ["- status: success"])
     except Exception as e:
         logger.error(f"Error running daily ML pipeline: {e}")
+        if NOTIFIER is not None:
+            NOTIFIER.notify("NIGHTLY PIPELINE FAILED", [f"- error: {e}"], level="ERROR")
 
 def run_daily_trading_bot():
     if STORE is not None:
         STORE.write_heartbeat("master_scheduler", "starting_live_trader", {"job": "live_trader"})
     logger.info("Initializing live trading bot...")
+    if NOTIFIER is not None:
+        NOTIFIER.notify("LIVE TRADER START", ["- job: live_trader"])
     # Check if today is a weekday
     today = datetime.datetime.now(pytz.timezone('America/New_York')).weekday()
     if today >= 5: # 5=Saturday, 6=Sunday
@@ -48,6 +58,8 @@ def run_daily_trading_bot():
         run_python_script('webull_live_trader.py')
     except Exception as e:
         logger.error(f"Daily trading bot error: {e}")
+        if NOTIFIER is not None:
+            NOTIFIER.notify("LIVE TRADER FAILED", [f"- error: {e}"], level="ERROR")
 
 
 def _sqlite_table_has_rows(sqlite_path: Path, table_name: str) -> bool:
@@ -114,13 +126,30 @@ def run_startup_pipeline_if_needed():
 
 def main():
     logger.info("Starting Master Scheduler. Timezone is set to America/New_York.")
-    global STORE
+    global STORE, NOTIFIER
     try:
-        STORE = SQLiteParquetStore(load_settings(SCRIPT_DIR))
+        settings = load_settings(SCRIPT_DIR)
+        STORE = SQLiteParquetStore(settings)
+        NOTIFIER = DiscordNotifier(settings, STORE)
         STORE.write_heartbeat("master_scheduler", "starting", {})
+        logger.info("Trading mode resolved to %s", settings.trade_mode)
+        broker_mode_lines = [
+            f"- mode: {settings.trade_mode}",
+            f"- bot_running: true",
+            f"- discord_enabled: {str(settings.discord_enabled).lower()}",
+        ]
+        discord_probe = NOTIFIER.probe()
+        broker_mode_lines.extend(
+            [
+                f"- discord_token_valid: {str(discord_probe.token_valid).lower()}",
+                f"- discord_can_send: {str(discord_probe.can_send_messages).lower()}",
+            ]
+        )
+        NOTIFIER.notify("SCHEDULER STARTUP", broker_mode_lines)
     except Exception as exc:
         logger.error("Failed to initialize scheduler store: %s", exc)
         STORE = None
+        NOTIFIER = None
     run_startup_pipeline_if_needed()
     
     # Nightly batch: refresh universe, bars, daily features, training panel, model bundle, shortlist.

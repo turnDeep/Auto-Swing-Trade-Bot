@@ -176,6 +176,63 @@ class SQLiteParquetStore:
                     message TEXT NOT NULL,
                     payload_json TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS slot_state (
+                    slot_id INTEGER NOT NULL,
+                    session_date TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    symbol TEXT,
+                    client_order_id TEXT,
+                    requested_quantity INTEGER NOT NULL,
+                    filled_quantity INTEGER NOT NULL,
+                    reserved_buying_power REAL NOT NULL,
+                    avg_fill_price REAL,
+                    side TEXT,
+                    updated_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY(session_date, slot_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS order_state_events (
+                    event_id TEXT PRIMARY KEY,
+                    client_order_id TEXT,
+                    session_date TEXT NOT NULL,
+                    symbol TEXT,
+                    slot_id INTEGER,
+                    event_type TEXT NOT NULL,
+                    from_status TEXT,
+                    to_status TEXT,
+                    created_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS discord_notifications (
+                    notification_id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    delivered INTEGER NOT NULL,
+                    channel_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    error_text TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS daily_trade_summary (
+                    session_date TEXT PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    today_pnl REAL NOT NULL,
+                    cumulative_pnl REAL NOT NULL,
+                    fills_today INTEGER NOT NULL,
+                    wins_today INTEGER NOT NULL,
+                    losses_today INTEGER NOT NULL,
+                    canceled_orders_today INTEGER NOT NULL,
+                    failed_orders_today INTEGER NOT NULL,
+                    remaining_positions INTEGER NOT NULL,
+                    all_positions_closed INTEGER NOT NULL,
+                    max_drawdown REAL,
+                    payload_json TEXT NOT NULL
+                );
                 """
             )
 
@@ -369,6 +426,16 @@ class SQLiteParquetStore:
         with self._connect() as connection:
             self._append_frame_chunked(connection, "live_fills", frame)
 
+    def load_live_fills(self, session_date: pd.Timestamp | None = None) -> pd.DataFrame:
+        query = "SELECT * FROM live_fills"
+        params: tuple = ()
+        if session_date is not None:
+            query += " WHERE session_date = ?"
+            params = (str(pd.Timestamp(session_date).date()),)
+        query += " ORDER BY timestamp ASC"
+        with self._connect() as connection:
+            return pd.read_sql_query(query, connection, params=params)
+
     def append_quote_snapshots(self, frame: pd.DataFrame) -> None:
         if frame.empty:
             return
@@ -519,6 +586,140 @@ class SQLiteParquetStore:
         )
         with self._connect() as connection:
             self._append_frame_chunked(connection, "alerts", row)
+
+    def replace_slot_states(self, frame: pd.DataFrame, session_date: pd.Timestamp) -> None:
+        work = frame.copy()
+        day = str(pd.Timestamp(session_date).date())
+        if not work.empty:
+            work["session_date"] = day
+        with self._connect() as connection:
+            connection.execute("DELETE FROM slot_state WHERE session_date = ?", (day,))
+            if not work.empty:
+                self._append_frame_chunked(connection, "slot_state", work)
+
+    def load_slot_states(self, session_date: pd.Timestamp | None = None) -> pd.DataFrame:
+        query = "SELECT * FROM slot_state"
+        params: tuple = ()
+        if session_date is not None:
+            query += " WHERE session_date = ?"
+            params = (str(pd.Timestamp(session_date).date()),)
+        query += " ORDER BY session_date DESC, slot_id ASC"
+        with self._connect() as connection:
+            return pd.read_sql_query(query, connection, params=params)
+
+    def append_order_state_event(
+        self,
+        *,
+        client_order_id: str | None,
+        session_date: pd.Timestamp,
+        symbol: str | None,
+        slot_id: int | None,
+        event_type: str,
+        from_status: str | None,
+        to_status: str | None,
+        payload: dict | None = None,
+    ) -> None:
+        row = pd.DataFrame(
+            [
+                {
+                    "event_id": json.dumps([client_order_id, event_type, pd.Timestamp.utcnow().isoformat()]),
+                    "client_order_id": client_order_id,
+                    "session_date": str(pd.Timestamp(session_date).date()),
+                    "symbol": symbol,
+                    "slot_id": slot_id,
+                    "event_type": event_type,
+                    "from_status": from_status,
+                    "to_status": to_status,
+                    "created_at": pd.Timestamp.utcnow().isoformat(),
+                    "payload_json": json.dumps(payload or {}, ensure_ascii=True, default=str),
+                }
+            ]
+        )
+        with self._connect() as connection:
+            self._append_frame_chunked(connection, "order_state_events", row)
+
+    def append_discord_notification(
+        self,
+        *,
+        level: str,
+        title: str,
+        mode: str,
+        delivered: bool,
+        channel_id: str | None,
+        payload: dict | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        row = pd.DataFrame(
+            [
+                {
+                    "notification_id": json.dumps([title, pd.Timestamp.utcnow().isoformat()]),
+                    "created_at": pd.Timestamp.utcnow().isoformat(),
+                    "level": level,
+                    "title": title,
+                    "mode": mode,
+                    "delivered": int(bool(delivered)),
+                    "channel_id": channel_id,
+                    "payload_json": json.dumps(payload or {}, ensure_ascii=True, default=str),
+                    "error_text": error_text,
+                }
+            ]
+        )
+        with self._connect() as connection:
+            self._append_frame_chunked(connection, "discord_notifications", row)
+
+    def save_daily_trade_summary(
+        self,
+        *,
+        session_date: pd.Timestamp,
+        mode: str,
+        today_pnl: float,
+        cumulative_pnl: float,
+        fills_today: int,
+        wins_today: int,
+        losses_today: int,
+        canceled_orders_today: int,
+        failed_orders_today: int,
+        remaining_positions: int,
+        all_positions_closed: bool,
+        max_drawdown: float | None,
+        payload: dict | None = None,
+    ) -> None:
+        row = pd.DataFrame(
+            [
+                {
+                    "session_date": str(pd.Timestamp(session_date).date()),
+                    "mode": mode,
+                    "today_pnl": today_pnl,
+                    "cumulative_pnl": cumulative_pnl,
+                    "fills_today": fills_today,
+                    "wins_today": wins_today,
+                    "losses_today": losses_today,
+                    "canceled_orders_today": canceled_orders_today,
+                    "failed_orders_today": failed_orders_today,
+                    "remaining_positions": remaining_positions,
+                    "all_positions_closed": int(bool(all_positions_closed)),
+                    "max_drawdown": max_drawdown,
+                    "payload_json": json.dumps(payload or {}, ensure_ascii=True, default=str),
+                }
+            ]
+        )
+        with self._connect() as connection:
+            connection.execute("DELETE FROM daily_trade_summary WHERE session_date = ?", (str(pd.Timestamp(session_date).date()),))
+            self._append_frame_chunked(connection, "daily_trade_summary", row)
+
+    def load_daily_trade_summaries(self) -> pd.DataFrame:
+        with self._connect() as connection:
+            return pd.read_sql_query("SELECT * FROM daily_trade_summary ORDER BY session_date ASC", connection)
+
+    def load_order_state_events(self, session_date: pd.Timestamp | None = None) -> pd.DataFrame:
+        query = "SELECT * FROM order_state_events"
+        params: tuple = ()
+        if session_date is not None:
+            query += " WHERE session_date = ?"
+            params = (str(pd.Timestamp(session_date).date()),)
+        query += " ORDER BY created_at ASC"
+        with self._connect() as connection:
+            return pd.read_sql_query(query, connection, params=params)
 
     def load_heartbeats(self) -> pd.DataFrame:
         with self._connect() as connection:
