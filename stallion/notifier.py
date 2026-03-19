@@ -7,6 +7,7 @@ from typing import Any
 
 import requests
 
+from .discord_notifier import DiscordNotifier
 from .storage import SQLiteParquetStore
 
 
@@ -20,6 +21,7 @@ def emit_alert(
     component: str,
     message: str,
     payload: dict[str, Any] | None = None,
+    discord: DiscordNotifier | None = None,
 ) -> None:
     body = payload or {}
     LOGGER.log(
@@ -30,6 +32,12 @@ def emit_alert(
         message,
     )
     store.append_alert(level=level.upper(), component=component, message=message, payload=body)
+    if discord is not None:
+        discord.notify(
+            f"{component} {level.upper()}",
+            [f"- message: {message}", f"- payload: {json.dumps(body, ensure_ascii=False, default=str)}"],
+            level=level.upper(),
+        )
 
     webhook_url = os.getenv("STALLION_ALERT_WEBHOOK_URL", "").strip()
     if not webhook_url:

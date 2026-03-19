@@ -35,6 +35,7 @@ class RuntimeConfig:
     watchlist_cv_min_train_sessions: int = 15
     watchlist_cv_embargo_sessions: int = 1
     max_positions: int = 4
+    fractional_shares_enabled: bool = False
     min_minutes_from_open: int = 5
     max_minutes_from_open: int = 90
     threshold_floor: float = 0.55
@@ -49,7 +50,12 @@ class RuntimeConfig:
     flatten_positions_minute: int = 58
     shutdown_hour: int = 16
     shutdown_minute: int = 5
-    order_cancel_after_seconds: int = 90
+    order_cancel_after_seconds: int = 300
+    marketable_limit_bps: float = 25.0
+    marketable_limit_retry_count: int = 1
+    demo_starting_buying_power: float = 100_000.0
+    pre_market_notification_hour: int = 9
+    pre_market_notification_minute: int = 25
     broker_sync_seconds: int = 60
     watchdog_stale_seconds: int = 180
 
@@ -72,6 +78,8 @@ class Credentials:
     webull_app_key: str | None
     webull_app_secret: str | None
     webull_account_id: str | None
+    discord_bot_token: str | None
+    discord_channel_id: str | None
 
 
 @dataclass(frozen=True)
@@ -80,6 +88,9 @@ class Settings:
     runtime: RuntimeConfig
     costs: CostConfig
     paths: PathsConfig
+    demo_mode: bool
+    trade_mode: str
+    discord_enabled: bool
 
 
 def _build_paths(root_dir: Path) -> PathsConfig:
@@ -111,12 +122,26 @@ def load_settings(root_dir: str | Path | None = None) -> Settings:
         webull_app_key=os.getenv("WEBULL_APP_KEY"),
         webull_app_secret=os.getenv("WEBULL_APP_SECRET"),
         webull_account_id=os.getenv("WEBULL_ACCOUNT_ID"),
+        discord_bot_token=os.getenv("DISCORD_BOT_TOKEN"),
+        discord_channel_id=os.getenv("DISCORD_CHANNEL_ID"),
     )
+    webull_live_ready = all(
+        str(value or "").strip()
+        for value in (
+            credentials.webull_app_key,
+            credentials.webull_app_secret,
+            credentials.webull_account_id,
+        )
+    )
+    demo_mode = not webull_live_ready
     settings = Settings(
         credentials=credentials,
         runtime=RuntimeConfig(),
         costs=CostConfig(),
         paths=_build_paths(root),
+        demo_mode=demo_mode,
+        trade_mode="DEMO" if demo_mode else "LIVE",
+        discord_enabled=bool(str(credentials.discord_bot_token or "").strip() and str(credentials.discord_channel_id or "").strip()),
     )
     settings.paths.data_dir.mkdir(parents=True, exist_ok=True)
     settings.paths.parquet_dir.mkdir(parents=True, exist_ok=True)
