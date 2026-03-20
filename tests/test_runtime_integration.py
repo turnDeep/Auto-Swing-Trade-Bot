@@ -4,10 +4,12 @@ import tempfile
 import unittest
 import gc
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
 
+from stallion.broker import WebullBroker
 from stallion.buying_power_manager import compute_order_quantity
 from stallion.config import load_settings
 from stallion.discord_notifier import DiscordNotifier
@@ -18,6 +20,7 @@ from stallion.live_trader import (
     _build_pre_market_lines,
     _cancel_stale_orders,
     _compute_close_summary,
+    _resolve_close_quantity,
     _submit_order_with_fallback,
 )
 from stallion.order_state import PositionSlot, normalize_order_status
@@ -26,9 +29,9 @@ from stallion.storage import SQLiteParquetStore
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int, payload: dict | None = None, text: str = "") -> None:
+    def __init__(self, status_code: int, payload=None, text: str = "") -> None:
         self.status_code = status_code
-        self._payload = payload or {}
+        self._payload = {} if payload is None else payload
         self.text = text
 
     def json(self):
@@ -88,6 +91,16 @@ class _FallbackBroker:
         }
 
 
+class _OrderHistoryAPI:
+    def __init__(self, payload=None) -> None:
+        self.payload = payload if payload is not None else []
+        self.page_sizes: list[int] = []
+
+    def get_order_history_request(self, account_id, page_size=None, start_date=None, end_date=None, last_client_order_id=None):
+        self.page_sizes.append(page_size)
+        return _FakeResponse(200, self.payload)
+
+
 class RuntimeIntegrationTests(unittest.TestCase):
     def _make_settings(self, root: Path, *, live: bool, discord: bool) -> object:
         env = {"FMP_API_KEY": "test-fmp"}
@@ -115,6 +128,55 @@ class RuntimeIntegrationTests(unittest.TestCase):
             settings = self._make_settings(Path(tempdir), live=True, discord=False)
             self.assertFalse(settings.demo_mode)
             self.assertEqual(settings.trade_mode, "LIVE")
+
+    def test_zero_buying_power_is_returned_as_valid_value(self):
+        broker = WebullBroker.__new__(WebullBroker)
+        broker.get_account_balance_raw = lambda: {
+            "buying_power": "0",
+            "account_currency_assets": [{"buying_power": "0", "cash_balance": "0"}],
+            "total_cash_balance": "0",
+        }
+        self.assertEqual(broker.get_account_buying_power(), 0.0)
+
+    def test_order_history_page_size_is_clamped_to_webull_limit(self):
+        broker = WebullBroker.__new__(WebullBroker)
+        order_api = _OrderHistoryAPI()
+        broker.settings = SimpleNamespace(credentials=SimpleNamespace(webull_account_id="acct"))
+        broker._api = SimpleNamespace(order_v2=order_api)
+        broker.get_order_history_df(lookback_days=2, page_size=200)
+        self.assertEqual(order_api.page_sizes, [100])
+
+    def test_positions_are_aggregated_by_symbol_with_summed_quantities(self):
+        broker = WebullBroker.__new__(WebullBroker)
+        payload = [
+            {
+                "symbol": "SOXL",
+                "quantity": "2",
+                "available_quantity": "1",
+                "avg_price": "10",
+                "market_value": "20",
+            },
+            {
+                "symbol": "SOXL",
+                "quantity": "3",
+                "available_quantity": "2",
+                "avg_price": "14",
+                "market_value": "42",
+            },
+        ]
+        broker.settings = SimpleNamespace(credentials=SimpleNamespace(webull_account_id="acct"))
+        broker._api = SimpleNamespace(account_v2=SimpleNamespace(get_account_position=lambda account_id: _FakeResponse(200, payload)))
+        positions = broker.get_positions_df()
+        self.assertEqual(len(positions), 1)
+        row = positions.iloc[0]
+        self.assertEqual(int(row["quantity"]), 5)
+        self.assertEqual(int(row["available_quantity"]), 3)
+        self.assertAlmostEqual(float(row["avg_price"]), 12.4, places=6)
+        self.assertAlmostEqual(float(row["market_value"]), 62.0, places=6)
+
+    def test_close_logic_prefers_available_quantity(self):
+        self.assertEqual(_resolve_close_quantity({"quantity": 10, "available_quantity": 4}), 4)
+        self.assertEqual(_resolve_close_quantity({"quantity": 10, "available_quantity": 0}), 10)
 
     def test_pre_market_notification_is_sent(self):
         with tempfile.TemporaryDirectory() as tempdir:
