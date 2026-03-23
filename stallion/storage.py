@@ -89,6 +89,16 @@ class SQLiteParquetStore:
                     PRIMARY KEY(symbol, session_date)
                 );
 
+                CREATE TABLE IF NOT EXISTS daily_tradeability_flags (
+                    symbol TEXT NOT NULL,
+                    session_date TEXT NOT NULL,
+                    close REAL,
+                    volume REAL,
+                    dollar_volume REAL,
+                    is_eligible INTEGER NOT NULL,
+                    PRIMARY KEY(symbol, session_date)
+                );
+
                 CREATE TABLE IF NOT EXISTS nightly_shortlist (
                     session_date TEXT NOT NULL,
                     symbol TEXT NOT NULL,
@@ -369,6 +379,21 @@ class SQLiteParquetStore:
             connection.execute("DELETE FROM daily_features")
             self._append_frame_chunked(connection, "daily_features", work)
         self.write_parquet_snapshot(frame, "features/daily/latest.parquet")
+
+    def save_daily_tradeability_flags(self, frame: pd.DataFrame) -> None:
+        if frame.empty:
+            return
+        work = frame.copy()
+        work["session_date"] = pd.to_datetime(work["session_date"], errors="coerce").dt.normalize().dt.strftime("%Y-%m-%d")
+        expected_columns = ["symbol", "session_date", "close", "volume", "dollar_volume", "is_eligible"]
+        for column in expected_columns:
+            if column not in work.columns:
+                work[column] = None
+        work = work[expected_columns].copy()
+        with self._connect() as connection:
+            connection.execute("DELETE FROM daily_tradeability_flags")
+            self._append_frame_chunked(connection, "daily_tradeability_flags", work)
+        self.write_parquet_snapshot(frame, "features/daily_tradeability/latest.parquet")
 
     def save_shortlist(self, session_date: pd.Timestamp, frame: pd.DataFrame) -> None:
         day = str(pd.Timestamp(session_date).date())
@@ -774,6 +799,28 @@ class SQLiteParquetStore:
         merged = pd.concat([frame.drop(columns=["payload_json"]), payload], axis=1)
         merged["session_date"] = pd.to_datetime(merged["session_date"])
         return merged
+
+    def load_daily_tradeability_flags(self, session_date: pd.Timestamp | None = None, symbols: Iterable[str] | None = None) -> pd.DataFrame:
+        query = "SELECT symbol, session_date, close, volume, dollar_volume, is_eligible FROM daily_tradeability_flags"
+        clauses = []
+        params: list[str] = []
+        if session_date is not None:
+            clauses.append("session_date = ?")
+            params.append(str(pd.Timestamp(session_date).date()))
+        if symbols:
+            symbol_list = tuple(sorted(set(symbols)))
+            placeholders = ",".join(["?"] * len(symbol_list))
+            clauses.append(f"symbol IN ({placeholders})")
+            params.extend(symbol_list)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        with self._connect() as connection:
+            frame = pd.read_sql_query(query, connection, params=tuple(params))
+        if frame.empty:
+            return frame
+        frame["session_date"] = pd.to_datetime(frame["session_date"])
+        frame["is_eligible"] = pd.to_numeric(frame["is_eligible"], errors="coerce").fillna(0).astype("int8")
+        return frame
 
     def load_shortlist(self, session_date: pd.Timestamp | None = None) -> pd.DataFrame:
         query = "SELECT session_date, symbol, rank_order, shortlist_score, payload_json FROM nightly_shortlist"
