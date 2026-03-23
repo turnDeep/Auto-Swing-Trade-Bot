@@ -38,6 +38,9 @@ def _anchored_vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd
         if window_high.empty:
             result.iloc[end] = np.nan
             continue
+        if window_high.dropna().empty:
+            result.iloc[end] = np.nan
+            continue
         anchor_label = window_high.idxmax()
         anchor_loc = close.index.get_loc(anchor_label)
         pv = (typical.iloc[anchor_loc : end + 1] * volume.iloc[anchor_loc : end + 1]).sum()
@@ -53,19 +56,42 @@ def _normalize_session_dates(values) -> pd.Series:
     return series.dt.normalize()
 
 
+def build_daily_tradeability_flags(
+    daily_bars: pd.DataFrame,
+    *,
+    min_price: float,
+    min_daily_volume: float,
+    min_dollar_volume: float,
+) -> pd.DataFrame:
+    if daily_bars.empty:
+        return pd.DataFrame(columns=["session_date", "symbol", "close", "volume", "dollar_volume", "is_eligible"])
+
+    work = daily_bars.copy()
+    localized = pd.to_datetime(work["ts"], utc=True, errors="coerce").dt.tz_convert("America/New_York")
+    work["session_date"] = _normalize_session_dates(localized)
+    work = work.dropna(subset=["session_date", "symbol"]).copy()
+    work["close"] = pd.to_numeric(work["close"], errors="coerce")
+    work["volume"] = pd.to_numeric(work["volume"], errors="coerce")
+    work["dollar_volume"] = work["close"] * work["volume"]
+    work["is_eligible"] = (
+        work["close"].ge(float(min_price))
+        & work["volume"].ge(float(min_daily_volume))
+        & work["dollar_volume"].ge(float(min_dollar_volume))
+    ).astype("int8")
+    return work[["session_date", "symbol", "close", "volume", "dollar_volume", "is_eligible"]].copy()
+
+
 def build_daily_feature_history(daily_bars: pd.DataFrame, universe: pd.DataFrame, spy_symbol: str = "SPY") -> pd.DataFrame:
     if daily_bars.empty or universe.empty:
         return pd.DataFrame(columns=["session_date", "symbol", *STANDARD_FEATURE_COLUMNS, "prev_day_high", "prev_day_atr14"])
 
     work = daily_bars.copy()
-    work["session_date"] = pd.to_datetime(work["ts"], utc=True, errors="coerce").dt.tz_convert("America/New_York").dt.normalize()
+    localized = pd.to_datetime(work["ts"], utc=True, errors="coerce").dt.tz_convert("America/New_York")
+    work["session_date"] = _normalize_session_dates(localized)
     work = work.dropna(subset=["session_date"]).sort_values(["symbol", "session_date"]).reset_index(drop=True)
     work["adj_close"] = work["adj_close"].fillna(work["close"])
     metadata = universe[["symbol", "sector", "industry"]].drop_duplicates(subset=["symbol"]).copy()
     work = work.merge(metadata, on="symbol", how="left")
-
-    spy = work.loc[work["symbol"] == spy_symbol, ["session_date", "adj_close"]].rename(columns={"adj_close": "spy_adj_close"})
-    spy = spy.drop_duplicates(subset=["session_date"]).set_index("session_date")
 
     feature_frames: list[pd.DataFrame] = []
     for symbol, frame in work.groupby("symbol", sort=False):
@@ -78,16 +104,15 @@ def build_daily_feature_history(daily_bars: pd.DataFrame, universe: pd.DataFrame
         frame["buy_pressure_20"] = money_flow_multiplier.rolling(20, min_periods=10).mean()
         frame["anchored_vwap_63"] = _anchored_vwap(frame["high"], frame["low"], frame["adj_close"], frame["volume"], lookback=63)
         frame["distance_to_avwap_63"] = (frame["adj_close"] / frame["anchored_vwap_63"]) - 1.0
-        spy_close = spy["spy_adj_close"].reindex(frame["session_date"])
-        frame["rs_21"] = frame["adj_close"].pct_change(21) - spy_close.pct_change(21).to_numpy()
-        frame["rs_63"] = frame["adj_close"].pct_change(63) - spy_close.pct_change(63).to_numpy()
-        frame["rs_126"] = frame["adj_close"].pct_change(126) - spy_close.pct_change(126).to_numpy()
-        frame["rs_252"] = frame["adj_close"].pct_change(252) - spy_close.pct_change(252).to_numpy()
+        frame["roc_21"] = ((frame["adj_close"] / frame["adj_close"].shift(21)) - 1.0) * 100.0
+        frame["roc_63"] = ((frame["adj_close"] / frame["adj_close"].shift(63)) - 1.0) * 100.0
+        frame["roc_126"] = ((frame["adj_close"] / frame["adj_close"].shift(126)) - 1.0) * 100.0
+        frame["roc_252"] = ((frame["adj_close"] / frame["adj_close"].shift(252)) - 1.0) * 100.0
         frame["daily_rs_score"] = (
-            0.15 * frame["rs_21"].fillna(0.0)
-            + 0.30 * frame["rs_63"].fillna(0.0)
-            + 0.30 * frame["rs_126"].fillna(0.0)
-            + 0.25 * frame["rs_252"].fillna(0.0)
+            0.40 * frame["roc_21"].fillna(0.0)
+            + 0.20 * frame["roc_63"].fillna(0.0)
+            + 0.20 * frame["roc_126"].fillna(0.0)
+            + 0.20 * frame["roc_252"].fillna(0.0)
         )
         frame["daily_rrs"] = frame["daily_rs_score"] / frame["atr_pct"].replace(0, np.nan)
         frame["prev_day_close_vs_sma50"] = (frame["adj_close"] / frame["sma50"]) - 1.0

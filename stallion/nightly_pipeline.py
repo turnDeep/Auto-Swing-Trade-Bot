@@ -7,12 +7,13 @@ from pathlib import Path
 import pandas as pd
 
 from .config import Settings, load_settings
-from .features import build_daily_feature_history
+from .features import build_daily_feature_history, build_daily_tradeability_flags
 from .fmp import FMPClient, download_yfinance_bars
 from .modeling import fit_hist_gbm, save_model_bundle
 from .storage import SQLiteParquetStore
 from .strategy import StandardSystemSpec
 from .watchlist_model import (
+    _build_session_map,
     _normalize_date_series,
     build_next_session_watchlist,
     build_stage2_intraday_panel,
@@ -38,6 +39,66 @@ def _latest_session_date(feature_frame: pd.DataFrame) -> pd.Timestamp:
     if normalized.empty:
         raise ValueError("No valid daily feature session dates available.")
     return pd.Timestamp(normalized.max()).normalize()
+
+
+def _filter_feature_frame_by_eligibility(
+    frame: pd.DataFrame,
+    eligibility_flags: pd.DataFrame,
+    *,
+    date_column: str,
+) -> pd.DataFrame:
+    if frame.empty or eligibility_flags.empty:
+        return frame.iloc[0:0].copy()
+    eligible = eligibility_flags.loc[eligibility_flags["is_eligible"].eq(1), ["session_date", "symbol"]].copy()
+    if eligible.empty:
+        return frame.iloc[0:0].copy()
+    eligible = eligible.rename(columns={"session_date": date_column})
+    eligible[date_column] = _normalize_date_series(eligible[date_column])
+    work = frame.copy()
+    work[date_column] = _normalize_date_series(work[date_column])
+    merged = work.merge(eligible.assign(_is_eligible=1), on=[date_column, "symbol"], how="left")
+    return merged.loc[merged["_is_eligible"].eq(1)].drop(columns=["_is_eligible"]).reset_index(drop=True)
+
+
+def _build_allowed_next_session_pairs(
+    daily_features: pd.DataFrame,
+    eligibility_flags: pd.DataFrame,
+) -> pd.DataFrame:
+    if daily_features.empty or eligibility_flags.empty:
+        return pd.DataFrame(columns=["session_date", "symbol"])
+    session_map = _build_session_map(daily_features)
+    if session_map.empty:
+        return pd.DataFrame(columns=["session_date", "symbol"])
+    session_map["feature_date"] = _normalize_date_series(session_map["feature_date"])
+    session_map["next_session_date"] = _normalize_date_series(session_map["next_session_date"])
+    eligible = eligibility_flags.loc[eligibility_flags["is_eligible"].eq(1), ["session_date", "symbol"]].copy()
+    if eligible.empty:
+        return pd.DataFrame(columns=["session_date", "symbol"])
+    eligible = eligible.rename(columns={"session_date": "feature_date"})
+    eligible["feature_date"] = _normalize_date_series(eligible["feature_date"])
+    allowed = session_map.merge(eligible, on="feature_date", how="inner")
+    if allowed.empty:
+        return pd.DataFrame(columns=["session_date", "symbol"])
+    return (
+        allowed[["next_session_date", "symbol"]]
+        .drop_duplicates()
+        .rename(columns={"next_session_date": "session_date"})
+        .reset_index(drop=True)
+    )
+
+
+def _filter_stage2_panel_by_eligibility(
+    labeled_panel: pd.DataFrame,
+    allowed_next_pairs: pd.DataFrame,
+) -> pd.DataFrame:
+    if labeled_panel.empty or allowed_next_pairs.empty:
+        return labeled_panel.iloc[0:0].copy()
+    work = labeled_panel.copy()
+    work["session_date"] = _normalize_date_series(work["session_date"])
+    allowed = allowed_next_pairs.copy()
+    allowed["session_date"] = _normalize_date_series(allowed["session_date"])
+    merged = work.merge(allowed.assign(_is_eligible=1), on=["session_date", "symbol"], how="left")
+    return merged.loc[merged["_is_eligible"].eq(1)].drop(columns=["_is_eligible"]).reset_index(drop=True)
 
 
 def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
@@ -71,9 +132,18 @@ def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
     LOGGER.info("Building daily feature history")
     daily_features = build_daily_feature_history(daily_bars, universe, spy_symbol="SPY")
     store.save_daily_features(daily_features)
+    tradeability_flags = build_daily_tradeability_flags(
+        daily_bars,
+        min_price=settings.runtime.min_price,
+        min_daily_volume=settings.runtime.min_daily_volume,
+        min_dollar_volume=settings.runtime.min_dollar_volume,
+    )
+    store.save_daily_tradeability_flags(tradeability_flags)
 
     LOGGER.info("Building stage-2 intraday training panel")
     labeled = build_stage2_intraday_panel(intraday_bars, daily_features, settings)
+    allowed_next_pairs = _build_allowed_next_session_pairs(daily_features, tradeability_flags)
+    labeled = _filter_stage2_panel_by_eligibility(labeled, allowed_next_pairs)
 
     if len(labeled) > spec.max_train_rows:
         labeled = labeled.tail(spec.max_train_rows).copy()
@@ -94,6 +164,11 @@ def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
     watchlist_spec = make_watchlist_model_spec(settings)
     watchlist_labels = make_watchlist_labels(daily_features, daily_bars, labeled)
     watchlist_training_panel = build_watchlist_training_panel(daily_features, watchlist_labels)
+    watchlist_training_panel = _filter_feature_frame_by_eligibility(
+        watchlist_training_panel,
+        tradeability_flags,
+        date_column="feature_date",
+    )
     store.write_parquet_snapshot(watchlist_training_panel, "artifacts/watchlist_training_panel/latest.parquet")
     if watchlist_training_panel.empty:
         raise RuntimeError("Watchlist training panel is empty; cannot build nightly shortlist model.")
@@ -130,6 +205,11 @@ def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
         .copy()
     )
     latest_watchlist_frame["feature_date"] = _normalize_date_series(latest_watchlist_frame["feature_date"])
+    latest_watchlist_frame = _filter_feature_frame_by_eligibility(
+        latest_watchlist_frame,
+        tradeability_flags,
+        date_column="feature_date",
+    )
     scored_watchlist = score_watchlist_universe(watchlist_model, watchlist_bundle, latest_watchlist_frame)
     shortlist = build_next_session_watchlist(scored_watchlist, settings.runtime.shortlist_count)
     shortlist["session_date"] = latest_date
@@ -148,6 +228,15 @@ def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
         "daily_rows": int(len(daily_bars)),
         "intraday_rows": int(len(intraday_bars)),
         "training_rows": int(len(labeled)),
+        "eligible_latest_symbol_count": int(
+            tradeability_flags.loc[
+                tradeability_flags["session_date"].eq(latest_date) & tradeability_flags["is_eligible"].eq(1),
+                "symbol",
+            ].nunique()
+        ),
+        "tradeability_flag_rows": int(len(tradeability_flags)),
+        "filtered_watchlist_training_rows": int(len(watchlist_training_panel)),
+        "filtered_watchlist_scoring_rows": int(len(latest_watchlist_frame)),
         "shortlist_count": int(len(shortlist)),
         "threshold": threshold,
         "model_path": str(model_path),

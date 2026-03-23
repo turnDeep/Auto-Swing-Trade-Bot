@@ -13,6 +13,7 @@ from stallion.broker import WebullBroker
 from stallion.buying_power_manager import compute_order_quantity
 from stallion.config import load_settings
 from stallion.discord_notifier import DiscordNotifier
+from stallion.features import build_daily_tradeability_flags
 from stallion.live_trader import (
     _build_close_summary_lines,
     _build_fill_lines,
@@ -22,6 +23,11 @@ from stallion.live_trader import (
     _compute_close_summary,
     _resolve_close_quantity,
     _submit_order_with_fallback,
+)
+from stallion.nightly_pipeline import (
+    _build_allowed_next_session_pairs,
+    _filter_feature_frame_by_eligibility,
+    _filter_stage2_panel_by_eligibility,
 )
 from stallion.order_state import PositionSlot, normalize_order_status
 from stallion.slot_manager import SlotManager
@@ -177,6 +183,98 @@ class RuntimeIntegrationTests(unittest.TestCase):
     def test_close_logic_prefers_available_quantity(self):
         self.assertEqual(_resolve_close_quantity({"quantity": 10, "available_quantity": 4}), 4)
         self.assertEqual(_resolve_close_quantity({"quantity": 10, "available_quantity": 0}), 10)
+
+    def test_daily_tradeability_flags_respect_price_volume_and_dollar_volume(self):
+        daily_bars = pd.DataFrame(
+            [
+                {
+                    "symbol": "AAA",
+                    "ts": "2026-03-19T20:00:00Z",
+                    "close": 5.0,
+                    "volume": 1_000_000,
+                },
+                {
+                    "symbol": "BBB",
+                    "ts": "2026-03-19T20:00:00Z",
+                    "close": 5.0,
+                    "volume": 900_000,
+                },
+                {
+                    "symbol": "CCC",
+                    "ts": "2026-03-19T20:00:00Z",
+                    "close": 9.0,
+                    "volume": 900_000,
+                },
+            ]
+        )
+        flags = build_daily_tradeability_flags(
+            daily_bars,
+            min_price=5.0,
+            min_daily_volume=1_000_000.0,
+            min_dollar_volume=10_000_000.0,
+        )
+        flag_map = {(row["symbol"], str(pd.Timestamp(row["session_date"]).date())): int(row["is_eligible"]) for _, row in flags.iterrows()}
+        self.assertEqual(flag_map[("AAA", "2026-03-19")], 0)
+        self.assertEqual(flag_map[("BBB", "2026-03-19")], 0)
+        self.assertEqual(flag_map[("CCC", "2026-03-19")], 0)
+
+        daily_bars.loc[daily_bars["symbol"].eq("CCC"), "volume"] = 1_500_000
+        flags = build_daily_tradeability_flags(
+            daily_bars,
+            min_price=5.0,
+            min_daily_volume=1_000_000.0,
+            min_dollar_volume=10_000_000.0,
+        )
+        eligible_symbols = set(flags.loc[flags["is_eligible"].eq(1), "symbol"])
+        self.assertEqual(eligible_symbols, {"CCC"})
+
+    def test_feature_frame_filter_uses_feature_date_eligibility(self):
+        frame = pd.DataFrame(
+            [
+                {"feature_date": pd.Timestamp("2026-03-18"), "symbol": "AAA", "x": 1},
+                {"feature_date": pd.Timestamp("2026-03-18"), "symbol": "BBB", "x": 2},
+                {"feature_date": pd.Timestamp("2026-03-19"), "symbol": "AAA", "x": 3},
+            ]
+        )
+        flags = pd.DataFrame(
+            [
+                {"session_date": pd.Timestamp("2026-03-18"), "symbol": "AAA", "is_eligible": 1},
+                {"session_date": pd.Timestamp("2026-03-18"), "symbol": "BBB", "is_eligible": 0},
+                {"session_date": pd.Timestamp("2026-03-19"), "symbol": "AAA", "is_eligible": 0},
+            ]
+        )
+        filtered = _filter_feature_frame_by_eligibility(frame, flags, date_column="feature_date")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered.iloc[0]["symbol"], "AAA")
+        self.assertEqual(str(pd.Timestamp(filtered.iloc[0]["feature_date"]).date()), "2026-03-18")
+
+    def test_stage2_panel_filter_uses_previous_session_eligibility(self):
+        daily_features = pd.DataFrame(
+            [
+                {"session_date": pd.Timestamp("2026-03-18"), "symbol": "AAA"},
+                {"session_date": pd.Timestamp("2026-03-18"), "symbol": "BBB"},
+                {"session_date": pd.Timestamp("2026-03-19"), "symbol": "AAA"},
+                {"session_date": pd.Timestamp("2026-03-19"), "symbol": "BBB"},
+            ]
+        )
+        flags = pd.DataFrame(
+            [
+                {"session_date": pd.Timestamp("2026-03-18"), "symbol": "AAA", "is_eligible": 1},
+                {"session_date": pd.Timestamp("2026-03-18"), "symbol": "BBB", "is_eligible": 0},
+                {"session_date": pd.Timestamp("2026-03-19"), "symbol": "AAA", "is_eligible": 0},
+                {"session_date": pd.Timestamp("2026-03-19"), "symbol": "BBB", "is_eligible": 1},
+            ]
+        )
+        allowed_pairs = _build_allowed_next_session_pairs(daily_features, flags)
+        panel = pd.DataFrame(
+            [
+                {"session_date": pd.Timestamp("2026-03-19"), "symbol": "AAA", "value": 1},
+                {"session_date": pd.Timestamp("2026-03-19"), "symbol": "BBB", "value": 2},
+            ]
+        )
+        filtered = _filter_stage2_panel_by_eligibility(panel, allowed_pairs)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered.iloc[0]["symbol"], "AAA")
 
     def test_pre_market_notification_is_sent(self):
         with tempfile.TemporaryDirectory() as tempdir:

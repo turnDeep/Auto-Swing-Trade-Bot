@@ -4,7 +4,7 @@ English | [日本語](./README.ja.md)
 
 Stallion-System-Trade is a two-stage intraday trading system for U.S. equities.
 
-- Stage 1: nightly watchlist model selects the next-session top 200 symbols from the Russell-3000 universe using 7 daily features.
+- Stage 1: nightly watchlist model selects the next-session top 100 symbols from the Russell-3000 universe using 7 daily features.
 - Stage 2: intraday execution model scores the shortlist with 16 features on 5-minute data and submits up to 4 positions.
 - Storage uses SQLite + Parquet.
 - Live trading supports Webull Japan accounts and automatically falls back to demo mode when required live credentials are missing.
@@ -27,6 +27,12 @@ Discord messages are prefixed with `[LIVE]` or `[DEMO]`.
 ### Stage 1: Nightly watchlist model
 
 - Universe: top 3000 U.S. stocks by market cap
+- Raw 1d and 5m history is retained for the full universe
+- Tradeability filtering is applied after feature construction and before stage-1 / stage-2 learning and latest watchlist scoring
+- Tradeability filter:
+  - `min_price >= 5.0`
+  - `min_daily_volume >= 1,000,000`
+  - `min_dollar_volume >= 10,000,000`
 - Input features at the latest completed close (`t`):
   1. `daily_buy_pressure_prev`
   2. `daily_rs_score_prev`
@@ -36,7 +42,8 @@ Discord messages are prefixed with `[LIVE]` or `[DEMO]`.
   6. `sector_buy_pressure_prev`
   7. `industry_rs_prev`
 - Model: `LogisticRegression`
-- Output: top 200 symbols for the next session (`t+1`)
+- `daily_rs_score` uses `0.40 * ROC21 + 0.20 * ROC63 + 0.20 * ROC126 + 0.20 * ROC252`
+- Output: top 100 symbols for the next session (`t+1`)
 
 ### Stage 2: Intraday execution
 

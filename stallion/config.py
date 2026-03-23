@@ -23,8 +23,8 @@ class CostConfig:
 class RuntimeConfig:
     market_timezone: str = "America/New_York"
     top_n_universe: int = 3000
-    shortlist_count: int = 200
-    monitor_count: int = 200
+    shortlist_count: int = 100
+    monitor_count: int = 100
     daily_history_days: int = 400
     intraday_history_sessions: int = 40
     same_slot_lookback_sessions: int = 20
@@ -41,7 +41,8 @@ class RuntimeConfig:
     threshold_floor: float = 0.55
     threshold_quantile: float = 0.90
     min_price: float = 5.0
-    min_dollar_volume: float = 5_000_000.0
+    min_daily_volume: float = 1_000_000.0
+    min_dollar_volume: float = 10_000_000.0
     quote_poll_seconds: int = 15
     batch_quote_chunk_size: int = 200
     no_new_orders_after_hour: int = 15
