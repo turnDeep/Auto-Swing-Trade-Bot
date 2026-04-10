@@ -61,6 +61,8 @@ class RuntimeConfig:
     batch_quote_chunk_size: int = 200
     no_new_orders_after_hour: int = 15
     no_new_orders_after_minute: int = 55
+    eod_exit_hour: int = 15
+    eod_exit_minute: int = 55
     shutdown_hour: int = 16
     shutdown_minute: int = 5
     order_cancel_after_seconds: int = 300

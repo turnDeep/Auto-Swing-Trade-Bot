@@ -345,6 +345,7 @@ def run_live_trader(settings: Settings | None = None) -> None:
     symbols = _load_shortlist_symbols(store, settings, today)
     aggregator = QuoteBarAggregator(session_timezone=settings.runtime.market_timezone)
     opening_buying_power = None
+    eod_exit_done = False  # ensure EOD exits run only once per session
 
     while True:
         now_ny = _ny_now(settings)
@@ -383,9 +384,45 @@ def run_live_trader(settings: Settings | None = None) -> None:
 
         _evaluate_intraday_hard_stops(store, broker, notifier, session_date=today, latest_quotes=quote_frame)
 
+        # ---------------------------------------------------------------
+        # EOD Exit at 15:55 (5 min before close) using live quote prices
+        # ---------------------------------------------------------------
+        if (
+            not eod_exit_done
+            and _after_time(now_ny, settings.runtime.eod_exit_hour, settings.runtime.eod_exit_minute)
+        ):
+            LOGGER.info("EOD EXIT triggered at %s (using live quote prices as proxy close)", now_ny.strftime("%H:%M"))
+            daily_bars_for_exit = store.load_bars("1d", symbols=symbols)
+            if not quote_frame.empty and not daily_bars_for_exit.empty:
+                # Patch today's close in daily_bars with the current live quote price
+                today_str = str(today.date())
+                quote_price_map = {
+                    str(row.symbol).upper(): float(row.price)
+                    for row in quote_frame.itertuples(index=False)
+                    if pd.notna(getattr(row, "price", None))
+                }
+                daily_bars_for_exit["ts"] = pd.to_datetime(daily_bars_for_exit["ts"], utc=True, errors="coerce")
+                today_mask = daily_bars_for_exit["ts"].dt.normalize().dt.tz_localize(None).dt.strftime("%Y-%m-%d") == today_str
+                for sym, live_price in quote_price_map.items():
+                    sym_mask = daily_bars_for_exit["symbol"].eq(sym)
+                    daily_bars_for_exit.loc[sym_mask & today_mask, "close"] = live_price
+                LOGGER.info(
+                    "Patched today's close for %d symbols using live quote prices for EOD exit evaluation.",
+                    len(quote_price_map),
+                )
+            _evaluate_end_of_day_exits(
+                store, broker, notifier,
+                session_date=today,
+                daily_bars=daily_bars_for_exit,
+                cfg=cfg,
+            )
+            eod_exit_done = True
+            notifier.notify(
+                "EOD EXIT SCAN COMPLETE",
+                [f"- time: {now_ny.strftime('%H:%M')} NY", "- using: live quote prices as proxy close"],
+            )
+
         if _after_time(now_ny, settings.runtime.shutdown_hour, settings.runtime.shutdown_minute):
-            daily_bars = store.load_bars("1d", symbols=symbols)
-            _evaluate_end_of_day_exits(store, broker, notifier, session_date=today, daily_bars=daily_bars, cfg=cfg)
             notifier.flush()
             return
 
