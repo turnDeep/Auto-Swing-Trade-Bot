@@ -175,7 +175,7 @@ def _finalize_report(
     report["golden_rule_pass"] = (
         report["broke_out"]
         & (report["leader_score"] >= 94.0)
-        & report["setup_score_pre"].between(70.0, 75.0)
+        & report["setup_score_pre"].between(71.0, 76.0)
         & (report["trigger_score"] >= 76.0)
     )
     report["breakout_signal"] = (
