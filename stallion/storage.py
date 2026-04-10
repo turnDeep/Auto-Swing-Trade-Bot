@@ -358,6 +358,21 @@ class SQLiteParquetStore:
             connection.commit()
         partition_label = "daily" if timeframe == "1d" else "intraday_5m"
         self.write_parquet_snapshot(work, f"raw/{partition_label}/latest.parquet")
+        # Write dated delta archive: merge-append so multiple save_bars() calls per day
+        # accumulate (e.g. live_trader flushes throughout the session).
+        today_label = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+        archive_rel = f"raw/{partition_label}/archive/{today_label}.parquet"
+        archive_path = self.parquet_dir / archive_rel
+        if archive_path.exists():
+            try:
+                existing = pd.read_parquet(archive_path)
+                combined = pd.concat([existing, work], ignore_index=True)
+                combined = combined.drop_duplicates(subset=["symbol", "ts"], keep="last")
+                work = combined
+            except Exception as exc:
+                LOGGER.warning("Could not merge existing archive %s, will overwrite: %s", archive_path, exc)
+        self.write_parquet_snapshot(work, archive_rel)
+        LOGGER.info("Saved %s bars to SQLite + archive (partition=%s, rows=%s)", timeframe, partition_label, len(work))
 
     def save_daily_features(self, frame: pd.DataFrame) -> None:
         if frame.empty:
@@ -755,6 +770,92 @@ class SQLiteParquetStore:
         destination.parent.mkdir(parents=True, exist_ok=True)
         frame.to_parquet(destination, index=False)
         return destination
+
+    def get_latest_timestamp(self, timeframe: str) -> pd.Timestamp | None:
+        """Return the most recent ts stored in bars_1d or bars_5m, or None if empty."""
+        table_name = "bars_1d" if timeframe == "1d" else "bars_5m"
+        try:
+            with self._connect() as connection:
+                row = connection.execute(f"SELECT MAX(ts) FROM {table_name}").fetchone()
+            if row and row[0]:
+                return pd.to_datetime(row[0], utc=True)
+        except Exception as exc:
+            LOGGER.warning("get_latest_timestamp failed for %s: %s", timeframe, exc)
+        return None
+
+    def get_bars_freshness_days(self, timeframe: str) -> float:
+        """Return the number of (calendar) days since the last stored bar, or inf if no data."""
+        latest = self.get_latest_timestamp(timeframe)
+        if latest is None:
+            return float("inf")
+        delta = pd.Timestamp.utcnow() - latest.tz_convert("UTC")
+        return max(0.0, delta.total_seconds() / 86400.0)
+
+    def get_latest_timestamps_by_symbol(self, timeframe: str, symbols: Iterable[str] | None = None) -> pd.DataFrame:
+        """Return the latest stored timestamp per symbol for a timeframe."""
+        table_name = "bars_1d" if timeframe == "1d" else "bars_5m"
+        with self._connect() as connection:
+            frame = pd.read_sql_query(
+                f"SELECT symbol, MAX(ts) AS latest_ts FROM {table_name} GROUP BY symbol ORDER BY symbol ASC",
+                connection,
+            )
+        if frame.empty:
+            return pd.DataFrame(columns=["symbol", "latest_ts"])
+        frame["symbol"] = frame["symbol"].astype(str).str.upper()
+        frame["latest_ts"] = pd.to_datetime(frame["latest_ts"], utc=True, errors="coerce")
+        if symbols is None:
+            return frame.reset_index(drop=True)
+        symbol_set = {
+            str(symbol).strip().upper()
+            for symbol in symbols
+            if str(symbol).strip()
+        }
+        if not symbol_set:
+            return pd.DataFrame(columns=["symbol", "latest_ts"])
+        return frame.loc[frame["symbol"].isin(symbol_set)].reset_index(drop=True)
+
+    def audit_symbol_gaps(
+        self,
+        timeframe: str,
+        expected_symbols: Iterable[str],
+        *,
+        tolerance_days: float = 1.0,
+    ) -> pd.DataFrame:
+        """
+        Compare each expected symbol's latest bar to the latest bar seen among that same symbol set.
+
+        Returns columns:
+          symbol, latest_ts, reference_ts, gap_days, status
+        where status is one of fresh / stale / missing.
+        """
+        symbols = sorted(
+            {
+                str(symbol).strip().upper()
+                for symbol in expected_symbols
+                if str(symbol).strip()
+            }
+        )
+        base = pd.DataFrame({"symbol": symbols})
+        if base.empty:
+            return pd.DataFrame(columns=["symbol", "latest_ts", "reference_ts", "gap_days", "status"])
+
+        latest_by_symbol = self.get_latest_timestamps_by_symbol(timeframe, symbols)
+        reference_ts = latest_by_symbol["latest_ts"].max() if not latest_by_symbol.empty else pd.NaT
+
+        audit = base.merge(latest_by_symbol, on="symbol", how="left")
+        audit["reference_ts"] = reference_ts
+        audit["gap_days"] = pd.NA
+        if pd.notna(reference_ts):
+            delta = reference_ts - audit["latest_ts"]
+            audit.loc[audit["latest_ts"].notna(), "gap_days"] = delta.dt.total_seconds() / 86400.0
+
+        audit["status"] = "fresh"
+        audit.loc[audit["latest_ts"].isna(), "status"] = "missing"
+        stale_mask = audit["latest_ts"].notna() & (
+            pd.to_numeric(audit["gap_days"], errors="coerce") > float(tolerance_days)
+        )
+        audit.loc[stale_mask, "status"] = "stale"
+        return audit.sort_values(["status", "symbol"], kind="mergesort").reset_index(drop=True)
 
     def load_universe(self) -> pd.DataFrame:
         query = "SELECT * FROM universe ORDER BY rank_market_cap ASC"

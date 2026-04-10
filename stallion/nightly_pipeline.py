@@ -6,112 +6,141 @@ from pathlib import Path
 
 import pandas as pd
 
+from .breakout_bridge import BreakoutConfig, build_breakout_signal_report
 from .config import Settings, load_settings
-from .features import build_daily_feature_history, build_daily_tradeability_flags
 from .fmp import FMPClient, download_yfinance_bars
-from .modeling import fit_hist_gbm, save_model_bundle
 from .storage import SQLiteParquetStore
-from .strategy import StandardSystemSpec
-from .watchlist_model import (
-    _build_session_map,
-    _normalize_date_series,
-    build_next_session_watchlist,
-    build_stage2_intraday_panel,
-    build_watchlist_training_panel,
-    evaluate_watchlist_model_cv,
-    extract_watchlist_feature_frame,
-    make_watchlist_labels,
-    make_watchlist_model_spec,
-    save_watchlist_model,
-    score_watchlist_universe,
-    train_watchlist_model,
-    write_watchlist_reports,
-)
 
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _latest_session_date(feature_frame: pd.DataFrame) -> pd.Timestamp:
-    if feature_frame.empty:
-        raise ValueError("No daily feature rows available.")
-    normalized = _normalize_date_series(feature_frame["session_date"]).dropna()
-    if normalized.empty:
-        raise ValueError("No valid daily feature session dates available.")
-    return pd.Timestamp(normalized.max()).normalize()
-
-
-def _filter_feature_frame_by_eligibility(
-    frame: pd.DataFrame,
-    eligibility_flags: pd.DataFrame,
-    *,
-    date_column: str,
-) -> pd.DataFrame:
-    if frame.empty or eligibility_flags.empty:
-        return frame.iloc[0:0].copy()
-    eligible = eligibility_flags.loc[eligibility_flags["is_eligible"].eq(1), ["session_date", "symbol"]].copy()
-    if eligible.empty:
-        return frame.iloc[0:0].copy()
-    eligible = eligible.rename(columns={"session_date": date_column})
-    eligible[date_column] = _normalize_date_series(eligible[date_column])
-    work = frame.copy()
-    work[date_column] = _normalize_date_series(work[date_column])
-    merged = work.merge(eligible.assign(_is_eligible=1), on=[date_column, "symbol"], how="left")
-    return merged.loc[merged["_is_eligible"].eq(1)].drop(columns=["_is_eligible"]).reset_index(drop=True)
-
-
-def _build_allowed_next_session_pairs(
-    daily_features: pd.DataFrame,
-    eligibility_flags: pd.DataFrame,
-) -> pd.DataFrame:
-    if daily_features.empty or eligibility_flags.empty:
-        return pd.DataFrame(columns=["session_date", "symbol"])
-    session_map = _build_session_map(daily_features)
-    if session_map.empty:
-        return pd.DataFrame(columns=["session_date", "symbol"])
-    session_map["feature_date"] = _normalize_date_series(session_map["feature_date"])
-    session_map["next_session_date"] = _normalize_date_series(session_map["next_session_date"])
-    eligible = eligibility_flags.loc[eligibility_flags["is_eligible"].eq(1), ["session_date", "symbol"]].copy()
-    if eligible.empty:
-        return pd.DataFrame(columns=["session_date", "symbol"])
-    eligible = eligible.rename(columns={"session_date": "feature_date"})
-    eligible["feature_date"] = _normalize_date_series(eligible["feature_date"])
-    allowed = session_map.merge(eligible, on="feature_date", how="inner")
-    if allowed.empty:
-        return pd.DataFrame(columns=["session_date", "symbol"])
+def _build_daily_summary(report: pd.DataFrame) -> pd.DataFrame:
+    if report.empty:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "setup_count",
+                "normal_setup_count",
+                "override_setup_count",
+                "breakout_count",
+                "breakout_signal_count",
+            ]
+        )
     return (
-        allowed[["next_session_date", "symbol"]]
-        .drop_duplicates()
-        .rename(columns={"next_session_date": "session_date"})
+        report.groupby("date", as_index=False)
+        .agg(
+            setup_count=("symbol", "size"),
+            normal_setup_count=("setup_tier", lambda s: int((s == "normal").sum())),
+            override_setup_count=("setup_tier", lambda s: int((s == "override").sum())),
+            breakout_count=("broke_out", "sum"),
+            breakout_signal_count=("breakout_signal", "sum"),
+        )
+        .sort_values("date")
         .reset_index(drop=True)
     )
 
 
-def _filter_stage2_panel_by_eligibility(
-    labeled_panel: pd.DataFrame,
-    allowed_next_pairs: pd.DataFrame,
+def _symbol_preview(symbols: list[str], limit: int = 12) -> str:
+    if not symbols:
+        return "-"
+    preview = ", ".join(symbols[:limit])
+    if len(symbols) > limit:
+        preview += ", ..."
+    return preview
+
+
+def _expected_latest_ts(
+    store: SQLiteParquetStore,
+    timeframe: str,
+    symbols: list[str],
+) -> pd.Timestamp | None:
+    latest_by_symbol = store.get_latest_timestamps_by_symbol(timeframe, symbols)
+    if latest_by_symbol.empty:
+        return None
+    latest_ts = latest_by_symbol["latest_ts"].max()
+    return None if pd.isna(latest_ts) else latest_ts
+
+
+def _repair_symbol_gaps(
+    *,
+    store: SQLiteParquetStore,
+    timeframe: str,
+    symbols: list[str],
+    interval: str,
+    bootstrap_period: str,
+    stale_tolerance_days: float,
+    overlap_days: int,
+    max_lookback_days: int | None = None,
 ) -> pd.DataFrame:
-    if labeled_panel.empty or allowed_next_pairs.empty:
-        return labeled_panel.iloc[0:0].copy()
-    work = labeled_panel.copy()
-    work["session_date"] = _normalize_date_series(work["session_date"])
-    allowed = allowed_next_pairs.copy()
-    allowed["session_date"] = _normalize_date_series(allowed["session_date"])
-    merged = work.merge(allowed.assign(_is_eligible=1), on=["session_date", "symbol"], how="left")
-    return merged.loc[merged["_is_eligible"].eq(1)].drop(columns=["_is_eligible"]).reset_index(drop=True)
+    audit = store.audit_symbol_gaps(timeframe, symbols, tolerance_days=stale_tolerance_days)
+    missing_symbols = audit.loc[audit["status"].eq("missing"), "symbol"].tolist()
+    stale_rows = audit.loc[audit["status"].eq("stale") & audit["latest_ts"].notna()].copy()
+    repaired_frames: list[pd.DataFrame] = []
+
+    if stale_rows.empty and not missing_symbols:
+        LOGGER.info("%s symbol audit passed for %s symbols", timeframe, len(audit))
+        return audit
+
+    stale_symbols = stale_rows["symbol"].tolist()
+    if stale_symbols:
+        stale_start = stale_rows["latest_ts"].min() - pd.Timedelta(days=overlap_days)
+        if max_lookback_days is not None:
+            min_allowed = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=max_lookback_days)
+            stale_start = max(stale_start, min_allowed)
+        stale_start_text = stale_start.strftime("%Y-%m-%d")
+        LOGGER.warning(
+            "%s symbol audit found %s stale symbols. Repairing from %s. preview=%s",
+            timeframe,
+            len(stale_symbols),
+            stale_start_text,
+            _symbol_preview(stale_symbols),
+        )
+        repaired_frames.append(
+            download_yfinance_bars(stale_symbols, interval=interval, start=stale_start_text)
+        )
+
+    if missing_symbols:
+        LOGGER.warning(
+            "%s symbol audit found %s missing symbols. Repairing with bootstrap window %s. preview=%s",
+            timeframe,
+            len(missing_symbols),
+            bootstrap_period,
+            _symbol_preview(missing_symbols),
+        )
+        repaired_frames.append(
+            download_yfinance_bars(missing_symbols, period=bootstrap_period, interval=interval)
+        )
+
+    if repaired_frames:
+        repaired = pd.concat(repaired_frames, ignore_index=True)
+        if timeframe == "5m" and not repaired.empty:
+            repaired["cumulative_volume"] = repaired["volume"]
+        store.save_bars(repaired, timeframe=timeframe)
+
+    final_audit = store.audit_symbol_gaps(timeframe, symbols, tolerance_days=stale_tolerance_days)
+    remaining = final_audit.loc[final_audit["status"].ne("fresh")].copy()
+    if not remaining.empty:
+        remaining_missing = remaining.loc[remaining["status"].eq("missing"), "symbol"].tolist()
+        remaining_stale = remaining.loc[remaining["status"].eq("stale"), "symbol"].tolist()
+        LOGGER.warning(
+            "%s symbol audit still has %s missing and %s stale symbols after repair. missing=%s stale=%s",
+            timeframe,
+            len(remaining_missing),
+            len(remaining_stale),
+            _symbol_preview(remaining_missing),
+            _symbol_preview(remaining_stale),
+        )
+    else:
+        LOGGER.info("%s symbol repair complete for %s symbols", timeframe, len(final_audit))
+    return final_audit
 
 
 def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
     settings = settings or load_settings()
     store = SQLiteParquetStore(settings)
     fmp = FMPClient(settings)
-    spec = StandardSystemSpec(
-        min_minutes_from_open=settings.runtime.min_minutes_from_open,
-        max_minutes_from_open=settings.runtime.max_minutes_from_open,
-        max_positions=settings.runtime.max_positions,
-        threshold_floor=settings.runtime.threshold_floor,
-        threshold_quantile=settings.runtime.threshold_quantile,
-    )
+    cfg = BreakoutConfig.from_settings(settings)
 
     LOGGER.info("Fetching top %s universe from FMP", settings.runtime.top_n_universe)
     universe = fmp.fetch_top_universe(settings.runtime.top_n_universe)
@@ -119,147 +148,143 @@ def run_nightly_pipeline(settings: Settings | None = None) -> dict[str, Path]:
 
     symbols = universe["symbol"].tolist()
     benchmark_symbols = ["SPY"]
-    LOGGER.info("Downloading daily bars via yfinance for %s symbols", len(symbols) + len(benchmark_symbols))
-    daily_bars = download_yfinance_bars(symbols + benchmark_symbols, period="2y", interval="1d")
-    store.save_bars(daily_bars, timeframe="1d")
+    daily_symbols = symbols + benchmark_symbols
 
-    intraday_period_days = min(60, max(settings.runtime.intraday_history_sessions, settings.runtime.training_sessions))
+    LOGGER.info("Downloading daily bars via yfinance for %s symbols", len(daily_symbols))
+    daily_latest_ts = _expected_latest_ts(store, "1d", daily_symbols)
+    if daily_latest_ts is not None:
+        daily_start = (daily_latest_ts - pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+        LOGGER.info("Differential daily fetch: start=%s (latest_ts=%s)", daily_start, daily_latest_ts.date())
+        daily_bars = download_yfinance_bars(daily_symbols, interval="1d", start=daily_start)
+    else:
+        LOGGER.info("No existing daily bars found - performing full 2y bootstrap download.")
+        daily_bars = download_yfinance_bars(daily_symbols, period="2y", interval="1d")
+    store.save_bars(daily_bars, timeframe="1d")
+    daily_gap_audit = _repair_symbol_gaps(
+        store=store,
+        timeframe="1d",
+        symbols=daily_symbols,
+        interval="1d",
+        bootstrap_period="2y",
+        stale_tolerance_days=1.0,
+        overlap_days=2,
+        max_lookback_days=730,
+    )
+
+    intraday_limit_days = 59
     LOGGER.info("Downloading 5m bars via yfinance for %s symbols", len(symbols))
-    intraday_bars = download_yfinance_bars(symbols, period=f"{intraday_period_days}d", interval="5m")
+    intraday_latest_ts = _expected_latest_ts(store, "5m", symbols)
+    if intraday_latest_ts is not None:
+        gap_days = (pd.Timestamp.utcnow() - intraday_latest_ts.tz_convert("UTC")).total_seconds() / 86400.0
+        fetch_days = min(int(gap_days) + 2, intraday_limit_days)
+        if gap_days > intraday_limit_days:
+            LOGGER.warning(
+                "5m data gap of %.1f days exceeds Yahoo 60-day limit - capping fetch at %d days. "
+                "Permanent hole of about %.0f days exists.",
+                gap_days,
+                intraday_limit_days,
+                gap_days - intraday_limit_days,
+            )
+        intraday_start = (pd.Timestamp.utcnow() - pd.Timedelta(days=fetch_days)).strftime("%Y-%m-%d")
+        LOGGER.info(
+            "Differential 5m fetch: start=%s (gap=%.1f days, fetch_days=%d)",
+            intraday_start,
+            gap_days,
+            fetch_days,
+        )
+        intraday_bars = download_yfinance_bars(symbols, interval="5m", start=intraday_start)
+    else:
+        LOGGER.info("No existing 5m bars found - performing full %d-day bootstrap download.", intraday_limit_days)
+        intraday_bars = download_yfinance_bars(symbols, period=f"{intraday_limit_days}d", interval="5m")
     intraday_bars["cumulative_volume"] = intraday_bars["volume"]
     store.save_bars(intraday_bars, timeframe="5m")
-
-    LOGGER.info("Building daily feature history")
-    daily_features = build_daily_feature_history(daily_bars, universe, spy_symbol="SPY")
-    store.save_daily_features(daily_features)
-    tradeability_flags = build_daily_tradeability_flags(
-        daily_bars,
-        min_price=settings.runtime.min_price,
-        min_daily_volume=settings.runtime.min_daily_volume,
-        min_dollar_volume=settings.runtime.min_dollar_volume,
-    )
-    store.save_daily_tradeability_flags(tradeability_flags)
-
-    LOGGER.info("Building stage-2 intraday training panel")
-    labeled = build_stage2_intraday_panel(intraday_bars, daily_features, settings)
-    allowed_next_pairs = _build_allowed_next_session_pairs(daily_features, tradeability_flags)
-    labeled = _filter_stage2_panel_by_eligibility(labeled, allowed_next_pairs)
-
-    if len(labeled) > spec.max_train_rows:
-        labeled = labeled.tail(spec.max_train_rows).copy()
-
-    LOGGER.info("Training HistGradientBoostingClassifier on %s rows", len(labeled))
-    model, threshold = fit_hist_gbm(labeled, spec)
-    model_path = settings.paths.model_dir / "hist_gbm_extended_5m_start.pkl"
-    bundle = save_model_bundle(model, threshold, model_path)
-    store.save_model_registry(
-        model_name=bundle.model_name,
-        created_at=bundle.created_at,
-        threshold=bundle.threshold,
-        artifact_path=bundle.artifact_path,
-        metadata={"feature_count": len(bundle.feature_columns), "training_rows": len(labeled)},
+    intraday_gap_audit = _repair_symbol_gaps(
+        store=store,
+        timeframe="5m",
+        symbols=symbols,
+        interval="5m",
+        bootstrap_period=f"{intraday_limit_days}d",
+        stale_tolerance_days=1.0,
+        overlap_days=2,
+        max_lookback_days=intraday_limit_days,
     )
 
-    LOGGER.info("Building watchlist training dataset")
-    watchlist_spec = make_watchlist_model_spec(settings)
-    watchlist_labels = make_watchlist_labels(daily_features, daily_bars, labeled)
-    watchlist_training_panel = build_watchlist_training_panel(daily_features, watchlist_labels)
-    watchlist_training_panel = _filter_feature_frame_by_eligibility(
-        watchlist_training_panel,
-        tradeability_flags,
-        date_column="feature_date",
-    )
-    store.write_parquet_snapshot(watchlist_training_panel, "artifacts/watchlist_training_panel/latest.parquet")
-    if watchlist_training_panel.empty:
-        raise RuntimeError("Watchlist training panel is empty; cannot build nightly shortlist model.")
+    LOGGER.info("Reloading full daily history from SQLite for signal scoring...")
+    full_daily_bars = store.load_bars("1d")
+    full_daily_bars["ts"] = pd.to_datetime(full_daily_bars["ts"], utc=True, errors="coerce")
+    full_daily_bars = full_daily_bars.rename(columns={"ts": "date"})
+    full_daily_bars["date"] = full_daily_bars["date"].dt.normalize()
 
-    latest_date = _latest_session_date(daily_features)
-    watchlist_model_path = settings.paths.model_dir / f"watchlist_logreg_top{settings.runtime.shortlist_count}.pkl"
-    LOGGER.info("Running watchlist OOS comparison")
-    watchlist_outputs = evaluate_watchlist_model_cv(
-        watchlist_training_panel,
-        daily_features,
-        labeled,
-        settings,
-        watchlist_spec,
-    )
-    watchlist_report_paths: dict[str, Path] = write_watchlist_reports(settings.paths.reports_dir / "watchlist_model", watchlist_outputs, watchlist_spec)
-    watchlist_model, watchlist_bundle = train_watchlist_model(watchlist_training_panel, watchlist_spec)
-    watchlist_bundle = save_watchlist_model(watchlist_model, watchlist_bundle, watchlist_model_path)
-    store.save_model_registry(
-        model_name=watchlist_bundle.model_name,
-        created_at=watchlist_bundle.created_at,
-        threshold=0.0,
-        artifact_path=watchlist_bundle.artifact_path,
-        metadata={
-            **watchlist_bundle.metadata,
-            "feature_count": len(watchlist_bundle.feature_columns),
-            "label_mode": watchlist_bundle.label_mode,
-            "report_path": str(watchlist_report_paths.get("watchlist_model_report.md", "")),
-        },
-    )
-    latest_watchlist_frame = extract_watchlist_feature_frame(daily_features)
-    latest_watchlist_frame = (
-        latest_watchlist_frame.loc[_normalize_date_series(latest_watchlist_frame["session_date"]).eq(latest_date)]
-        .rename(columns={"session_date": "feature_date"})
+    LOGGER.info("Reloading full 5m intraday history from SQLite for signal scoring...")
+    full_intraday_bars = store.load_bars("5m")
+    full_intraday_bars["ts"] = pd.to_datetime(full_intraday_bars["ts"], utc=True, errors="coerce")
+
+    daily_signal_bars = full_daily_bars.loc[full_daily_bars["symbol"].ne("SPY")].copy()
+    report = build_breakout_signal_report(daily_signal_bars, full_intraday_bars, cfg=cfg)
+    summary = _build_daily_summary(report)
+
+    latest_date = pd.to_datetime(report["date"]).max().normalize() if not report.empty else pd.Timestamp.utcnow().normalize()
+    shortlist = (
+        report.loc[
+            report["date"].eq(latest_date)
+            & report["setup_candidate"].fillna(False)
+        ]
+        .sort_values(["leader_score", "setup_score_pre", "symbol"], ascending=[False, False, True], kind="mergesort")
+        .head(settings.runtime.shortlist_count)
         .copy()
     )
-    latest_watchlist_frame["feature_date"] = _normalize_date_series(latest_watchlist_frame["feature_date"])
-    latest_watchlist_frame = _filter_feature_frame_by_eligibility(
-        latest_watchlist_frame,
-        tradeability_flags,
-        date_column="feature_date",
-    )
-    scored_watchlist = score_watchlist_universe(watchlist_model, watchlist_bundle, latest_watchlist_frame)
-    shortlist = build_next_session_watchlist(scored_watchlist, settings.runtime.shortlist_count)
     shortlist["session_date"] = latest_date
     shortlist["next_session_date"] = latest_date + pd.offsets.BDay(1)
 
-    shortlist_session_key = latest_date
-    if "next_session_date" in shortlist.columns and shortlist["next_session_date"].notna().any():
-        shortlist_session_key = pd.to_datetime(shortlist["next_session_date"]).dropna().min().normalize()
-    store.save_shortlist(shortlist_session_key, shortlist)
-    shortlist.to_parquet(settings.paths.watchlist_path, index=False)
+    shortlist_session_key = latest_date + pd.offsets.BDay(1)
+    if not shortlist.empty:
+        shortlist_session_key = pd.to_datetime(shortlist["next_session_date"]).iloc[0].normalize()
+        store.save_shortlist(shortlist_session_key, shortlist)
+        shortlist.to_parquet(settings.paths.watchlist_path, index=False)
+    else:
+        settings.paths.watchlist_path.parent.mkdir(parents=True, exist_ok=True)
+        shortlist.to_parquet(settings.paths.watchlist_path, index=False)
 
-    report_path = settings.paths.reports_dir / "nightly_pipeline_report.json"
-    report = {
+    report_path = settings.paths.reports_dir / "breakout_signal_report.parquet"
+    summary_path = settings.paths.reports_dir / "breakout_signal_daily_summary.csv"
+    nightly_report_path = settings.paths.reports_dir / "nightly_pipeline_report.json"
+
+    report.to_parquet(report_path, index=False)
+    summary.to_csv(summary_path, index=False)
+
+    nightly_report = {
         "session_date": str(latest_date.date()),
         "universe_count": int(len(universe)),
-        "daily_rows": int(len(daily_bars)),
-        "intraday_rows": int(len(intraday_bars)),
-        "training_rows": int(len(labeled)),
-        "eligible_latest_symbol_count": int(
-            tradeability_flags.loc[
-                tradeability_flags["session_date"].eq(latest_date) & tradeability_flags["is_eligible"].eq(1),
-                "symbol",
-            ].nunique()
-        ),
-        "tradeability_flag_rows": int(len(tradeability_flags)),
-        "filtered_watchlist_training_rows": int(len(watchlist_training_panel)),
-        "filtered_watchlist_scoring_rows": int(len(latest_watchlist_frame)),
+        "daily_rows_fetched": int(len(daily_bars)),
+        "intraday_rows_fetched": int(len(intraday_bars)),
+        "daily_rows_total": int(len(full_daily_bars)),
+        "intraday_rows_total": int(len(full_intraday_bars)),
+        "report_rows": int(len(report)),
+        "breakout_signal_count": int(report["breakout_signal"].fillna(False).sum()) if not report.empty else 0,
         "shortlist_count": int(len(shortlist)),
-        "threshold": threshold,
-        "model_path": str(model_path),
-        "watchlist_model_path": str(watchlist_model_path),
-        "watchlist_label_mode": watchlist_spec.label_mode,
+        "daily_symbol_missing_count": int(daily_gap_audit["status"].eq("missing").sum()),
+        "daily_symbol_stale_count": int(daily_gap_audit["status"].eq("stale").sum()),
+        "intraday_symbol_missing_count": int(intraday_gap_audit["status"].eq("missing").sum()),
+        "intraday_symbol_stale_count": int(intraday_gap_audit["status"].eq("stale").sum()),
         "watchlist_path": str(settings.paths.watchlist_path),
+        "report_path": str(report_path),
+        "summary_path": str(summary_path),
         "shortlist_session_key": str(pd.Timestamp(shortlist_session_key).date()),
-        "watchlist_report_paths": {key: str(path) for key, path in watchlist_report_paths.items()},
     }
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    nightly_report_path.write_text(json.dumps(nightly_report, indent=2), encoding="utf-8")
 
-    LOGGER.info("Nightly pipeline complete for %s", latest_date.date())
+    LOGGER.info("Nightly breakout pipeline complete for %s", latest_date.date())
     return {
-        "report_path": report_path,
-        "model_path": model_path,
+        "report_path": nightly_report_path,
         "watchlist_path": settings.paths.watchlist_path,
+        "signal_report_path": report_path,
     }
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     outputs = run_nightly_pipeline()
-    print(f"Nightly pipeline complete: {outputs['report_path']}")
+    print(f"Nightly breakout pipeline complete: {outputs['report_path']}")
 
 
 if __name__ == "__main__":

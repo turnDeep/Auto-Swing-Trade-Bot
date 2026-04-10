@@ -1,104 +1,150 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pandas as pd
 
+from .breakout_bridge import (
+    BreakoutConfig,
+    normalize_daily_bars,
+    normalize_intraday_bars,
+    run_breakout_backtest,
+    run_breakout_backtest_from_inputs,
+)
 from .config import load_settings
-from .features import build_daily_tradeability_flags, build_intraday_feature_panel, build_training_labels
-from .modeling import fit_hist_gbm, score_candidates
-from .nightly_pipeline import _build_allowed_next_session_pairs, _filter_stage2_panel_by_eligibility
 from .storage import SQLiteParquetStore
-from .strategy import StandardSystemSpec, select_candidates_for_session
 
 
 LOGGER = logging.getLogger(__name__)
 
 
+def _flatten_daily_history(path: Path) -> pd.DataFrame:
+    history = pd.read_pickle(path)
+    if not isinstance(history, dict):
+        return normalize_daily_bars(history)
+    frames: list[pd.DataFrame] = []
+    for symbol, frame in history.items():
+        if frame is None or len(frame) == 0:
+            continue
+        work = frame.copy()
+        work.index = pd.to_datetime(work.index).tz_localize(None).normalize()
+        work.index.name = "date"
+        work = work.reset_index()
+        work.columns = [str(col).lower() for col in work.columns]
+        work["symbol"] = symbol
+        frames.append(work[["symbol", "date", "open", "high", "low", "close", "volume"]])
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _flatten_intraday_history(path: Path) -> pd.DataFrame:
+    history = pd.read_pickle(path)
+    if not isinstance(history, dict):
+        return normalize_intraday_bars(history)
+    frames: list[pd.DataFrame] = []
+    for symbol, frame in history.items():
+        if frame is None or len(frame) == 0:
+            continue
+        work = frame.copy()
+        work.index = pd.to_datetime(work.index)
+        if getattr(work.index, "tz", None) is not None:
+            work.index = work.index.tz_convert("America/New_York").tz_localize(None)
+        work.index.name = "datetime"
+        work = work.reset_index()
+        work.columns = [str(col).lower() for col in work.columns]
+        work["symbol"] = symbol
+        frames.append(work[["symbol", "datetime", "open", "high", "low", "close", "volume"]])
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _load_backtest_pickles() -> tuple[pd.DataFrame, pd.DataFrame] | None:
+    daily_pickle = os.getenv("STALLION_BACKTEST_DAILY_PICKLE", "").strip()
+    intraday_pickle = os.getenv("STALLION_BACKTEST_INTRADAY_PICKLE", "").strip()
+    if not daily_pickle or not intraday_pickle:
+        return None
+
+    daily_path = Path(daily_pickle)
+    intraday_path = Path(intraday_pickle)
+    if not daily_path.exists() or not intraday_path.exists():
+        raise FileNotFoundError("STALLION_BACKTEST_DAILY_PICKLE / STALLION_BACKTEST_INTRADAY_PICKLE paths must exist")
+
+    daily = _flatten_daily_history(daily_path)
+    intraday = _flatten_intraday_history(intraday_path)
+    return daily, intraday
+
+
 def run_backtest_report() -> Path:
     settings = load_settings()
     store = SQLiteParquetStore(settings)
-    spec = StandardSystemSpec(
-        min_minutes_from_open=settings.runtime.min_minutes_from_open,
-        max_minutes_from_open=settings.runtime.max_minutes_from_open,
-        max_positions=settings.runtime.max_positions,
-        threshold_floor=settings.runtime.threshold_floor,
-        threshold_quantile=settings.runtime.threshold_quantile,
-    )
+    signals_parquet = os.getenv("STALLION_BACKTEST_SIGNALS_PARQUET", "").strip()
+    daily_parquet = os.getenv("STALLION_BACKTEST_DAILY_PARQUET", "").strip()
+    intraday_parquet = os.getenv("STALLION_BACKTEST_INTRADAY_PARQUET", "").strip()
+    direct_inputs = _load_backtest_pickles()
+    if signals_parquet:
+        if not daily_parquet or not intraday_parquet:
+            raise ValueError("STALLION_BACKTEST_DAILY_PARQUET and STALLION_BACKTEST_INTRADAY_PARQUET are required with STALLION_BACKTEST_SIGNALS_PARQUET.")
+        LOGGER.info("Running breakout backtest from prepared signal inputs")
+        daily_bars = pd.read_parquet(daily_parquet)
+        intraday_bars = pd.read_parquet(intraday_parquet)
+        signals = pd.read_parquet(signals_parquet) if signals_parquet.endswith(".parquet") else pd.read_csv(signals_parquet)
+    else:
+        if direct_inputs is not None:
+            LOGGER.info("Running breakout backtest directly from frozen pickles")
+            daily_bars, intraday_bars = direct_inputs
+        else:
+            daily_bars = store.load_bars("1d")
+            intraday_bars = store.load_bars("5m")
+        signals = None
+    if daily_bars.empty or intraday_bars.empty:
+        raise RuntimeError("No local 1d/5m history available. Run the nightly pipeline first or set STALLION_BACKTEST_* environment variables.")
 
-    intraday = store.load_bars("5m")
-    daily_bars = store.load_bars("1d")
-    daily_features = store.load_daily_features()
-    if intraday.empty or daily_features.empty or daily_bars.empty:
-        raise RuntimeError("No local SQLite history available. Run the nightly pipeline first.")
+    cfg = BreakoutConfig.from_settings(settings)
+    daily_bars = daily_bars.loc[daily_bars["symbol"].ne("SPY")].copy() if "symbol" in daily_bars.columns else daily_bars
+    if signals is not None:
+        equity_curve, fills_df, stats = run_breakout_backtest_from_inputs(daily_bars, intraday_bars, signals, cfg=cfg)
+        report = pd.DataFrame()
+    else:
+        equity_curve, fills_df, stats, report = run_breakout_backtest(daily_bars, intraday_bars, cfg=cfg)
 
-    panel = build_intraday_feature_panel(intraday, daily_features, same_slot_lookback_sessions=settings.runtime.same_slot_lookback_sessions)
-    panel = panel[panel["session_bucket"].eq("open_drive")].copy()
-    panel = panel[panel["minutes_from_open"].between(spec.min_minutes_from_open, spec.max_minutes_from_open, inclusive="both")].copy()
-    labeled = build_training_labels(
-        panel,
-        commission_rate_one_way=settings.costs.commission_rate_one_way,
-        slippage_bps_per_side=settings.costs.slippage_bps_per_side,
-        spread_bps_round_trip=settings.costs.spread_bps_round_trip,
-        adverse_fill_floor=settings.costs.extra_adverse_fill_floor,
-        adverse_fill_cap=settings.costs.extra_adverse_fill_cap,
-    ).dropna(subset=["next_open", "session_close"])
-    tradeability_flags = store.load_daily_tradeability_flags()
-    if tradeability_flags.empty:
-        tradeability_flags = build_daily_tradeability_flags(
-            daily_bars,
-            min_price=settings.runtime.min_price,
-            min_daily_volume=settings.runtime.min_daily_volume,
-            min_dollar_volume=settings.runtime.min_dollar_volume,
-        )
-    allowed_next_pairs = _build_allowed_next_session_pairs(daily_features, tradeability_flags)
-    labeled = _filter_stage2_panel_by_eligibility(labeled, allowed_next_pairs)
-    if labeled.empty:
-        raise RuntimeError("No labeled panel rows available for backtest.")
+    reports_dir = settings.paths.reports_dir
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    equity_path = reports_dir / "breakout_equity_curve.csv"
+    fills_path = reports_dir / "breakout_fills.csv"
+    summary_path = reports_dir / "breakout_summary.csv"
+    report_path = reports_dir / "breakout_signal_report.parquet"
+    markdown_path = reports_dir / "backtest_report.md"
 
-    split_idx = int(len(labeled) * 0.7)
-    train = labeled.iloc[:split_idx].copy()
-    test = labeled.iloc[split_idx:].copy()
-    model, threshold = fit_hist_gbm(train, spec)
-    scored = score_candidates(model, test)
-    scored["threshold"] = threshold
+    equity_curve.to_csv(equity_path, index=False)
+    fills_df.to_csv(fills_path, index=False)
+    pd.DataFrame([stats]).to_csv(summary_path, index=False)
+    if not report.empty:
+        report.to_parquet(report_path, index=False)
 
-    trade_rows = []
-    for session_date, frame in scored.groupby("session_date", sort=True):
-        chosen = select_candidates_for_session(frame, threshold=threshold, max_positions=spec.max_positions)
-        if chosen.empty:
-            continue
-        chosen["trade_return"] = chosen["net_return_stress_exec"]
-        chosen["session_date"] = pd.to_datetime(chosen["session_date"])
-        trade_rows.append(chosen)
-
-    trades = pd.concat(trade_rows, ignore_index=True) if trade_rows else pd.DataFrame()
-    report_path = settings.paths.reports_dir / "backtest_report.md"
-    if trades.empty:
-        report_path.write_text("# Backtest Report\n\nNo trades executed.\n", encoding="utf-8")
-        return report_path
-
-    summary = {
-        "trade_count": int(len(trades)),
-        "win_rate": float((trades["trade_return"] > 0).mean()),
-        "avg_trade_return": float(trades["trade_return"].mean()),
-        "total_return": float(trades["trade_return"].sum()),
-    }
     lines = [
         "# Backtest Report",
         "",
         "## Summary",
         "",
-        f"- trade_count: {summary['trade_count']}",
-        f"- win_rate: {summary['win_rate']:.2%}",
-        f"- avg_trade_return: {summary['avg_trade_return']:.4%}",
-        f"- total_return: {summary['total_return']:.4%}",
+        f"- end_equity: {stats.get('end_equity', float('nan')):,.2f}",
+        f"- total_return: {stats.get('total_return', float('nan')):.4%}",
+        f"- max_drawdown: {stats.get('max_drawdown', float('nan')):.4%}",
+        f"- sharpe: {stats.get('sharpe', float('nan')):.4f}",
+        f"- sortino: {stats.get('sortino', float('nan')):.4f}",
+        f"- win_rate: {stats.get('win_rate', float('nan')):.2%}",
+        f"- profit_factor: {stats.get('profit_factor', float('nan')):.4f}",
+        f"- signal_count: {int(report['breakout_signal'].fillna(False).sum()) if not report.empty and 'breakout_signal' in report.columns else len(signals) if signals is not None else 0}",
+        "",
+        "## Outputs",
+        "",
+        f"- equity_curve: {equity_path}",
+        f"- fills: {fills_path}",
+        f"- summary: {summary_path}",
+        f"- signal_report: {report_path}",
         "",
     ]
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-    trades.to_parquet(settings.paths.reports_dir / "backtest_trades.parquet", index=False)
-    return report_path
+    markdown_path.write_text("\n".join(lines), encoding="utf-8")
+    return markdown_path
 
 
 def main() -> None:

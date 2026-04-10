@@ -526,8 +526,6 @@ def _run_stage2_for_shortlists(
         min_minutes_from_open=settings.runtime.min_minutes_from_open,
         max_minutes_from_open=settings.runtime.max_minutes_from_open,
         max_positions=settings.runtime.max_positions,
-        threshold_floor=settings.runtime.threshold_floor,
-        threshold_quantile=settings.runtime.threshold_quantile,
     )
     train_mask = _normalize_date_series(intraday_labeled["session_date"]).isin(_normalize_date_series(train_execution_dates))
     train_intraday = intraday_labeled.loc[train_mask].copy()

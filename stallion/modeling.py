@@ -34,7 +34,7 @@ def fit_hist_gbm(train_frame: pd.DataFrame, spec: StandardSystemSpec) -> tuple[H
     )
     model.fit(frame[features], frame["label_stress_exec"].astype(int))
     train_scores = model.predict_proba(frame[features])[:, 1]
-    threshold = compute_threshold(train_scores, floor=spec.threshold_floor, quantile=spec.threshold_quantile)
+    threshold = compute_threshold(train_scores)
     return model, threshold
 
 
