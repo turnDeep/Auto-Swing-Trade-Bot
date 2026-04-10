@@ -17,7 +17,8 @@ from stallion.config import load_settings
 from stallion.discord_notifier import DiscordNotifier
 from stallion.storage import SQLiteParquetStore
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_FILENAME = "hist_gbm_extended_5m_start.pkl"
@@ -143,56 +144,57 @@ def _notify_detailed_failure(title: str, exc: Exception, *, component: str, scri
             )
 
 
-def run_python_script(script_name):
-    logger.info(f"Running script: {script_name}")
+def run_python_script(script_name: str) -> None:
+    logger.info("Running script: %s", script_name)
     try:
         subprocess.run(
-            [sys.executable, script_name], 
-            check=True, 
+            [sys.executable, script_name],
+            check=True,
             cwd=SCRIPT_DIR,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError as exc:
         raise ScriptExecutionError(
             script_name=script_name,
-            return_code=int(e.returncode),
-            stdout_tail=_redact_sensitive_text(_tail_text(e.stdout)),
-            stderr_tail=_redact_sensitive_text(_tail_text(e.stderr)),
-        ) from e
+            return_code=int(exc.returncode),
+            stdout_tail=_redact_sensitive_text(_tail_text(exc.stdout)),
+            stderr_tail=_redact_sensitive_text(_tail_text(exc.stderr)),
+        ) from exc
 
-def run_daily_ml_pipeline():
+
+def run_daily_ml_pipeline() -> None:
     if STORE is not None:
         STORE.write_heartbeat("master_scheduler", "running_pipeline", {"job": "nightly_pipeline"})
-    logger.info("Starting nightly standard daytrade pipeline...")
+    logger.info("Starting nightly breakout pipeline...")
     if NOTIFIER is not None:
         NOTIFIER.notify("NIGHTLY PIPELINE START", ["- job: nightly_pipeline"])
     try:
-        run_python_script('ml_pipeline_60d.py')
-        logger.info("Nightly standard pipeline completed successfully. Shortlist and model artifacts updated.")
+        run_python_script("nightly_breakout_pipeline.py")
+        logger.info("Nightly breakout pipeline completed successfully. Shortlist and reports updated.")
         if NOTIFIER is not None:
             NOTIFIER.notify("NIGHTLY PIPELINE COMPLETE", ["- status: success"])
-    except Exception as e:
-        _notify_detailed_failure("NIGHTLY PIPELINE FAILED", e, component="master_scheduler", script_name="ml_pipeline_60d.py")
+    except Exception as exc:
+        _notify_detailed_failure("NIGHTLY PIPELINE FAILED", exc, component="master_scheduler", script_name="nightly_breakout_pipeline.py")
 
-def run_daily_trading_bot():
+
+def run_daily_trading_bot() -> None:
     if STORE is not None:
         STORE.write_heartbeat("master_scheduler", "starting_live_trader", {"job": "live_trader"})
     logger.info("Initializing live trading bot...")
     if NOTIFIER is not None:
         NOTIFIER.notify("LIVE TRADER START", ["- job: live_trader"])
-    # Check if today is a weekday
-    today = datetime.datetime.now(pytz.timezone('America/New_York')).weekday()
-    if today >= 5: # 5=Saturday, 6=Sunday
+    today = datetime.datetime.now(pytz.timezone("America/New_York")).weekday()
+    if today >= 5:
         logger.info("Today is a weekend. No trading.")
         return
-        
+
     try:
-        run_python_script('webull_live_trader.py')
-    except Exception as e:
-        _notify_detailed_failure("LIVE TRADER FAILED", e, component="master_scheduler", script_name="webull_live_trader.py")
+        run_python_script("breakout_live_trader.py")
+    except Exception as exc:
+        _notify_detailed_failure("LIVE TRADER FAILED", exc, component="master_scheduler", script_name="breakout_live_trader.py")
 
 
 def _sqlite_table_has_rows(sqlite_path: Path, table_name: str) -> bool:
@@ -209,18 +211,15 @@ def _sqlite_table_has_rows(sqlite_path: Path, table_name: str) -> bool:
 def _parquet_has_rows(path: Path) -> bool:
     if not path.exists():
         return False
-
     try:
         frame = pd.read_parquet(path)
     except Exception:
         return False
-
     return not frame.empty
 
 
 def bootstrap_artifacts_ready() -> tuple[bool, list[str]]:
     reasons: list[str] = []
-
     try:
         settings = load_settings(SCRIPT_DIR)
     except Exception as exc:
@@ -229,7 +228,6 @@ def bootstrap_artifacts_ready() -> tuple[bool, list[str]]:
     required_files = {
         "sqlite database": settings.paths.sqlite_path,
         "shortlist parquet": settings.paths.watchlist_path,
-        "model artifact": settings.paths.model_dir / MODEL_FILENAME,
     }
     for label, path in required_files.items():
         if not path.exists():
@@ -238,7 +236,7 @@ def bootstrap_artifacts_ready() -> tuple[bool, list[str]]:
     if settings.paths.watchlist_path.exists() and not _parquet_has_rows(settings.paths.watchlist_path):
         reasons.append(f"empty shortlist parquet at {settings.paths.watchlist_path}")
 
-    required_tables = ("universe", "daily_features", "nightly_shortlist", "model_registry")
+    required_tables = ("universe", "nightly_shortlist")
     for table_name in required_tables:
         if not _sqlite_table_has_rows(settings.paths.sqlite_path, table_name):
             reasons.append(f"sqlite table {table_name} is missing or empty")
@@ -246,7 +244,87 @@ def bootstrap_artifacts_ready() -> tuple[bool, list[str]]:
     return len(reasons) == 0, reasons
 
 
-def run_startup_pipeline_if_needed():
+def _symbol_preview(symbols: list[str], limit: int = 12) -> str:
+    if not symbols:
+        return "-"
+    preview = ", ".join(symbols[:limit])
+    if len(symbols) > limit:
+        preview += ", ..."
+    return preview
+
+
+def _check_bars_freshness(store: SQLiteParquetStore | None) -> None:
+    if store is None:
+        return
+    stale_daily_days = 4
+    stale_5m_days = 4
+    try:
+        daily_age = store.get_bars_freshness_days("1d")
+        if daily_age == float("inf"):
+            logger.warning("FRESHNESS CHECK: bars_1d table is EMPTY - no daily data stored yet.")
+        elif daily_age > stale_daily_days:
+            logger.warning(
+                "FRESHNESS CHECK: bars_1d last updated %.1f days ago (threshold=%d). "
+                "Nightly pipeline may not have run recently.",
+                daily_age,
+                stale_daily_days,
+            )
+        else:
+            logger.info("FRESHNESS CHECK: bars_1d is fresh (%.1f days old).", daily_age)
+
+        intraday_age = store.get_bars_freshness_days("5m")
+        if intraday_age == float("inf"):
+            logger.warning("FRESHNESS CHECK: bars_5m table is EMPTY - no intraday data stored yet.")
+        elif intraday_age > stale_5m_days:
+            logger.warning(
+                "FRESHNESS CHECK: bars_5m last updated %.1f days ago (threshold=%d). "
+                "5m intraday data is STALE - live signals will use outdated conditions.",
+                intraday_age,
+                stale_5m_days,
+            )
+        else:
+            logger.info("FRESHNESS CHECK: bars_5m is fresh (%.1f days old).", intraday_age)
+
+        universe = store.load_universe()
+        symbols = universe["symbol"].dropna().astype(str).str.upper().tolist() if not universe.empty else []
+        if not symbols:
+            logger.warning("FRESHNESS CHECK: universe is empty, skipping symbol-level bar audit.")
+            return
+
+        daily_gap_audit = store.audit_symbol_gaps("1d", symbols, tolerance_days=1.0)
+        daily_missing = daily_gap_audit.loc[daily_gap_audit["status"].eq("missing"), "symbol"].tolist()
+        daily_stale = daily_gap_audit.loc[daily_gap_audit["status"].eq("stale"), "symbol"].tolist()
+        if daily_missing or daily_stale:
+            logger.warning(
+                "FRESHNESS CHECK: bars_1d symbol audit found %s missing and %s stale symbols. "
+                "missing=%s stale=%s",
+                len(daily_missing),
+                len(daily_stale),
+                _symbol_preview(daily_missing),
+                _symbol_preview(daily_stale),
+            )
+        else:
+            logger.info("FRESHNESS CHECK: bars_1d symbol audit passed for %s universe symbols.", len(daily_gap_audit))
+
+        intraday_gap_audit = store.audit_symbol_gaps("5m", symbols, tolerance_days=1.0)
+        intraday_missing = intraday_gap_audit.loc[intraday_gap_audit["status"].eq("missing"), "symbol"].tolist()
+        intraday_stale = intraday_gap_audit.loc[intraday_gap_audit["status"].eq("stale"), "symbol"].tolist()
+        if intraday_missing or intraday_stale:
+            logger.warning(
+                "FRESHNESS CHECK: bars_5m symbol audit found %s missing and %s stale symbols. "
+                "missing=%s stale=%s",
+                len(intraday_missing),
+                len(intraday_stale),
+                _symbol_preview(intraday_missing),
+                _symbol_preview(intraday_stale),
+            )
+        else:
+            logger.info("FRESHNESS CHECK: bars_5m symbol audit passed for %s universe symbols.", len(intraday_gap_audit))
+    except Exception as exc:
+        logger.warning("FRESHNESS CHECK: could not read bar timestamps: %s", exc)
+
+
+def run_startup_pipeline_if_needed() -> None:
     ready, reasons = bootstrap_artifacts_ready()
     if not ready:
         logger.info("Bootstrap artifacts missing or incomplete. Running one-shot nightly pipeline bootstrap now...")
@@ -254,10 +332,10 @@ def run_startup_pipeline_if_needed():
             logger.info("Bootstrap check: %s", reason)
         run_daily_ml_pipeline()
         return
-
     logger.info("SQLite + Parquet bootstrap artifacts detected. Skipping startup pipeline bootstrap.")
 
-def main():
+
+def main() -> None:
     logger.info("Starting Master Scheduler. Timezone is set to America/New_York.")
     global STORE, NOTIFIER
     try:
@@ -268,7 +346,7 @@ def main():
         logger.info("Trading mode resolved to %s", settings.trade_mode)
         broker_mode_lines = [
             f"- mode: {settings.trade_mode}",
-            f"- bot_running: true",
+            "- bot_running: true",
             f"- discord_enabled: {str(settings.discord_enabled).lower()}",
         ]
         discord_probe = NOTIFIER.probe()
@@ -283,30 +361,29 @@ def main():
         logger.error("Failed to initialize scheduler store: %s", exc)
         STORE = None
         NOTIFIER = None
+
     run_startup_pipeline_if_needed()
-    
-    # Nightly batch: refresh universe, bars, daily features, training panel, model bundle, shortlist.
+    _check_bars_freshness(STORE)
+
     schedule.every().monday.at("17:00").do(run_daily_ml_pipeline)
     schedule.every().tuesday.at("17:00").do(run_daily_ml_pipeline)
     schedule.every().wednesday.at("17:00").do(run_daily_ml_pipeline)
     schedule.every().thursday.at("17:00").do(run_daily_ml_pipeline)
     schedule.every().friday.at("17:00").do(run_daily_ml_pipeline)
-    
-    # Live bot: loads the saved model + shortlist and starts polling before the open.
+
     schedule.every().monday.at("09:25").do(run_daily_trading_bot)
     schedule.every().tuesday.at("09:25").do(run_daily_trading_bot)
     schedule.every().wednesday.at("09:25").do(run_daily_trading_bot)
     schedule.every().thursday.at("09:25").do(run_daily_trading_bot)
     schedule.every().friday.at("09:25").do(run_daily_trading_bot)
-    
+
     logger.info("Scheduler loops configured. Waiting for next assigned task...")
-    
-    # Main infinite loop
     while True:
         if STORE is not None:
             STORE.write_heartbeat("master_scheduler", "idle", {})
         schedule.run_pending()
-        time.sleep(60) # check every minute
+        time.sleep(60)
+
 
 if __name__ == "__main__":
     main()

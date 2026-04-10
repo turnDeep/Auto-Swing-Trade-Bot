@@ -76,15 +76,16 @@ def _parse_yfinance_download(raw: pd.DataFrame, symbols: list[str]) -> tuple[pd.
 def _download_yfinance_batch(
     symbols: list[str],
     *,
-    period: str,
+    period: str | None,
     interval: str,
     auto_adjust: bool,
     session,
     timeout: int,
+    start: str | None = None,
+    end: str | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    raw = yf.download(
+    kwargs: dict = dict(
         tickers=" ".join(symbols),
-        period=period,
         interval=interval,
         auto_adjust=auto_adjust,
         group_by="ticker",
@@ -95,18 +96,27 @@ def _download_yfinance_batch(
         session=session,
         multi_level_index=True,
     )
+    if start is not None:
+        kwargs["start"] = start
+        if end is not None:
+            kwargs["end"] = end
+    else:
+        kwargs["period"] = period or "60d"
+    raw = yf.download(**kwargs)
     return _parse_yfinance_download(raw, symbols)
 
 
 def _download_yfinance_single_with_retry(
     symbol: str,
     *,
-    period: str,
+    period: str | None,
     interval: str,
     auto_adjust: bool,
     session,
     timeout: int,
     retry_delays: tuple[float, ...],
+    start: str | None = None,
+    end: str | None = None,
 ) -> pd.DataFrame:
     last_frame = pd.DataFrame()
     for attempt, delay in enumerate((0.0, *retry_delays), start=1):
@@ -120,6 +130,8 @@ def _download_yfinance_single_with_retry(
                 auto_adjust=auto_adjust,
                 session=session,
                 timeout=timeout,
+                start=start,
+                end=end,
             )
         except Exception as exc:  # pragma: no cover - network variance
             LOGGER.warning("yfinance single download failed for %s on attempt %s: %s", symbol, attempt, exc)
@@ -204,7 +216,20 @@ class FMPClient:
         return frame
 
 
-def download_yfinance_bars(symbols: list[str], period: str, interval: str, auto_adjust: bool = False) -> pd.DataFrame:
+def download_yfinance_bars(
+    symbols: list[str],
+    period: str | None = None,
+    interval: str = "1d",
+    auto_adjust: bool = False,
+    start: str | None = None,
+    end: str | None = None,
+) -> pd.DataFrame:
+    """Download OHLCV bars from yfinance.
+
+    Provide either ``period`` (e.g. ``'2y'``) OR explicit ``start``/``end`` dates
+    (``'YYYY-MM-DD'``) for a differential / incremental fetch.  When ``start``
+    is given it takes priority over ``period``.
+    """
     if not symbols:
         return pd.DataFrame()
 
@@ -222,10 +247,11 @@ def download_yfinance_bars(symbols: list[str], period: str, interval: str, auto_
     missing_symbols: list[str] = []
     symbol_chunks = _chunk_symbols(deduped_symbols, chunk_size)
 
+    range_desc = f"start={start}" if start else f"period={period or '60d'}"
     LOGGER.info(
-        "Downloading yfinance bars: interval=%s period=%s symbols=%s chunks=%s chunk_size=%s session=%s",
+        "Downloading yfinance bars: interval=%s %s symbols=%s chunks=%s chunk_size=%s session=%s",
         interval,
-        period,
+        range_desc,
         len(deduped_symbols),
         len(symbol_chunks),
         chunk_size,
@@ -246,6 +272,8 @@ def download_yfinance_bars(symbols: list[str], period: str, interval: str, auto_
                     auto_adjust=auto_adjust,
                     session=session,
                     timeout=timeout,
+                    start=start,
+                    end=end,
                 )
             except Exception as exc:  # pragma: no cover - network variance
                 LOGGER.warning(
@@ -287,6 +315,8 @@ def download_yfinance_bars(symbols: list[str], period: str, interval: str, auto_
             session=session,
             timeout=timeout,
             retry_delays=retry_delays,
+            start=start,
+            end=end,
         )
         if frame.empty:
             still_missing.append(symbol)
