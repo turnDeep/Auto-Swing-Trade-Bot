@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pandas as pd
 import pytz
-import schedule
 
 from stallion.config import load_settings
 from stallion.discord_notifier import DiscordNotifier
@@ -365,24 +364,45 @@ def main() -> None:
     run_startup_pipeline_if_needed()
     _check_bars_freshness(STORE)
 
-    schedule.every().monday.at("17:00").do(run_daily_ml_pipeline)
-    schedule.every().tuesday.at("17:00").do(run_daily_ml_pipeline)
-    schedule.every().wednesday.at("17:00").do(run_daily_ml_pipeline)
-    schedule.every().thursday.at("17:00").do(run_daily_ml_pipeline)
-    schedule.every().friday.at("17:00").do(run_daily_ml_pipeline)
+    # Implementation of native timezone-aware loop to replace 'schedule' library
+    # schedule.every().monday.at("17:00").do(run_daily_ml_pipeline) ... etc
+    tz_ny = pytz.timezone("America/New_York")
+    last_trading_date = None
+    last_pipeline_date = None
 
-    schedule.every().monday.at("09:25").do(run_daily_trading_bot)
-    schedule.every().tuesday.at("09:25").do(run_daily_trading_bot)
-    schedule.every().wednesday.at("09:25").do(run_daily_trading_bot)
-    schedule.every().thursday.at("09:25").do(run_daily_trading_bot)
-    schedule.every().friday.at("09:25").do(run_daily_trading_bot)
+    logger.info("Scheduler loop started. Timezone is set to America/New_York.")
+    logger.info("Monitoring for: 09:25 AM (Trading Bot) and 17:00 (Nightly Pipeline) NY time.")
 
-    logger.info("Scheduler loops configured. Waiting for next assigned task...")
     while True:
-        if STORE is not None:
-            STORE.write_heartbeat("master_scheduler", "idle", {})
-        schedule.run_pending()
-        time.sleep(60)
+        try:
+            if STORE is not None:
+                STORE.write_heartbeat("master_scheduler", "idle", {})
+
+            now_ny = datetime.datetime.now(tz_ny)
+            current_date = now_ny.strftime("%Y-%m-%d")
+
+            # 1. Trading Bot (09:25 AM NY, Monday-Friday)
+            if now_ny.weekday() < 5:
+                # Trigger at or after 09:25
+                if now_ny.hour > 9 or (now_ny.hour == 9 and now_ny.minute >= 25):
+                    if last_trading_date != current_date:
+                        logger.info("Triggering Daily Trading Bot (NY Time: %s)", now_ny.strftime("%H:%M:%S"))
+                        run_daily_trading_bot()
+                        last_trading_date = current_date
+
+            # 2. Nightly ML Pipeline (17:00 / 05:00 PM NY, Monday-Friday)
+            if now_ny.weekday() < 5:
+                # Trigger at or after 17:00
+                if now_ny.hour >= 17:
+                    if last_pipeline_date != current_date:
+                        logger.info("Triggering Nightly ML Pipeline (NY Time: %s)", now_ny.strftime("%H:%M:%S"))
+                        run_daily_ml_pipeline()
+                        last_pipeline_date = current_date
+
+            time.sleep(30)
+        except Exception as e:
+            logger.error("Error in scheduler loop: %s", e)
+            time.sleep(60)
 
 
 if __name__ == "__main__":
