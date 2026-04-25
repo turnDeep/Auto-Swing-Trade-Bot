@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -22,11 +23,97 @@ INTRADAY_PATH = ROOT / "analysis_outputs" / "russell3000_full_dataset" / "intrad
 OUT_DIR = ROOT / "analysis_outputs" / "v4_rs_percentile_breakout_report"
 SESSION_TZ = "America/New_York"
 DAILY_LOOKBACK_CALENDAR_DAYS = 450
+CALIBRATED_PARAMS_PATH = ROOT / "calibrated_params.json"
+
+DEFAULT_CALIBRATED_PARAMS: dict[str, object] = {
+    "daily_calibration": {
+        "leader_min": 89.0,
+        "leader_quantile": 0.85,
+        "standard_setup_min": 58.0,
+        "tight_setup_min": 57.0,
+        "use_setup_max": False,
+    },
+    "intraday_calibration": {
+        "standard_breakout": {
+            "trigger_min": 72.0,
+            "cum_vol_ratio_min": 0.0,
+            "bar_vol_ratio_min": 0.0,
+        },
+        "tight_reversal": {
+            "trigger_min": 69.0,
+            "cum_vol_ratio_min": 0.0,
+            "bar_vol_ratio_min": 0.0,
+            "entry_dist_norm_max": 0.80,
+            "gap_norm_max": 0.70,
+            "same_day_stop_rate_max": 0.35,
+        },
+    },
+}
 
 NORMAL_SETUP_MIN = 58.0
 NORMAL_TRIGGER_MIN = 70.0
 OVERRIDE_SETUP_MIN = 48.0
 OVERRIDE_TRIGGER_MIN = 75.0
+
+
+def load_calibrated_params(path: Path = CALIBRATED_PARAMS_PATH) -> dict[str, object]:
+    params: dict[str, object] = json.loads(json.dumps(DEFAULT_CALIBRATED_PARAMS))
+    if not path.exists():
+        return params
+
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    for section, values in loaded.items():
+        if isinstance(values, dict) and isinstance(params.get(section), dict):
+            params[section].update(values)  # type: ignore[union-attr]
+        else:
+            params[section] = values
+    return params
+
+
+def _cfg_get(params: dict[str, object], section: str, key: str, default: float | bool) -> float | bool:
+    values = params.get(section, {})
+    if not isinstance(values, dict):
+        return default
+    return values.get(key, default)
+
+
+def _nested_get(
+    params: dict[str, object],
+    section: str,
+    subsection: str,
+    key: str,
+    default: float | bool,
+) -> float | bool:
+    values = params.get(section, {})
+    if not isinstance(values, dict):
+        return default
+    subvalues = values.get(subsection, {})
+    if not isinstance(subvalues, dict):
+        return default
+    return subvalues.get(key, default)
+
+
+def _zigzag_entry_config_from_params(params: dict[str, object]) -> ZigZagEntryConfig:
+    daily = params.get("daily_calibration", {})
+    if not isinstance(daily, dict):
+        daily = {}
+    use_setup_max = bool(daily.get("use_setup_max", False))
+    setup_max_value = daily.get("tight_setup_max")
+
+    return ZigZagEntryConfig(
+        leader_min=float(daily.get("leader_min", DEFAULT_CALIBRATED_PARAMS["daily_calibration"]["leader_min"])),  # type: ignore[index]
+        setup_min=float(daily.get("tight_setup_min", DEFAULT_CALIBRATED_PARAMS["daily_calibration"]["tight_setup_min"])),  # type: ignore[index]
+        setup_max=float(setup_max_value) if use_setup_max and setup_max_value is not None else None,
+        trigger_min=float(_nested_get(params, "intraday_calibration", "tight_reversal", "trigger_min", 69.0)),
+        cum_vol_ratio_min=float(_nested_get(params, "intraday_calibration", "tight_reversal", "cum_vol_ratio_min", 0.0)),
+        bar_vol_ratio_min=float(_nested_get(params, "intraday_calibration", "tight_reversal", "bar_vol_ratio_min", 0.0)),
+        tight_max_entry_dist_norm=float(
+            _nested_get(params, "intraday_calibration", "tight_reversal", "entry_dist_norm_max", 0.80)
+        ),
+        tight_max_positive_gap_norm=float(
+            _nested_get(params, "intraday_calibration", "tight_reversal", "gap_norm_max", 0.70)
+        ),
+    )
 
 
 def _add_same_time_volume_features(
@@ -148,6 +235,7 @@ def _prepare_setup_candidates(
         "volume",
         "prev_close",
         "atr20",
+        "adr20_pct",
         "pivot_high",
         "diag_resistance",
         "diag_resistance_prev",
@@ -171,6 +259,13 @@ def _finalize_report(
     setup_candidates: pd.DataFrame,
     first_breakouts: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    params = load_calibrated_params()
+    leader_min = float(_cfg_get(params, "daily_calibration", "leader_min", 89.0))
+    setup_min = float(_cfg_get(params, "daily_calibration", "standard_setup_min", 58.0))
+    trigger_min = float(_nested_get(params, "intraday_calibration", "standard_breakout", "trigger_min", 72.0))
+    cum_vol_min = float(_nested_get(params, "intraday_calibration", "standard_breakout", "cum_vol_ratio_min", 0.0))
+    bar_vol_min = float(_nested_get(params, "intraday_calibration", "standard_breakout", "bar_vol_ratio_min", 0.0))
+
     report = setup_candidates.merge(
         first_breakouts,
         on=["symbol", "date"],
@@ -180,16 +275,21 @@ def _finalize_report(
 
     report["breakout_type"] = report["breakout_type"].fillna("none")
     report["broke_out"] = report["breakout_type"] != "none"
-    report["golden_rule_pass"] = (
+    trigger_score = pd.to_numeric(report["trigger_score"], errors="coerce")
+    cum_vol_ratio = pd.to_numeric(report["cum_vol_ratio_at_trigger"], errors="coerce").fillna(0.0)
+    bar_vol_ratio = pd.to_numeric(report["bar_vol_ratio_at_trigger"], errors="coerce").fillna(0.0)
+    report["standard_rule_pass"] = (
         report["broke_out"]
-        & (report["leader_score"] >= 94.0)
-        & report["setup_score_pre"].between(71.0, 76.0)
-        & (report["trigger_score"] >= 76.0)
+        & (pd.to_numeric(report["leader_score"], errors="coerce") >= leader_min)
+        & (pd.to_numeric(report["setup_score_pre"], errors="coerce") >= setup_min)
+        & (trigger_score >= trigger_min)
+        & (cum_vol_ratio >= cum_vol_min)
+        & (bar_vol_ratio >= bar_vol_min)
     )
+    report["golden_rule_pass"] = report["standard_rule_pass"]
     report["breakout_signal"] = (
         report["history_ok"]
-        & report["leader_pass"]
-        & report["golden_rule_pass"]
+        & report["standard_rule_pass"]
     )
     report["trigger_time_ny"] = pd.to_datetime(report["trigger_time"]).dt.strftime("%H:%M")
     report["date"] = pd.to_datetime(report["date"]).dt.normalize()
@@ -504,8 +604,9 @@ def _build_zigzag_signal_report(
     *,
     session_tz: str = SESSION_TZ,
 ) -> pd.DataFrame:
-    zig_cfg = ZigZagBreakoutConfig()
-    entry_cfg = ZigZagEntryConfig()
+    calibrated_params = load_calibrated_params()
+    entry_cfg = _zigzag_entry_config_from_params(calibrated_params)
+    zig_cfg = ZigZagBreakoutConfig(leader_min=entry_cfg.leader_min)
 
     zig_daily = _normalize_zigzag_daily_input(daily_df.copy())
     if intraday_df is None or intraday_df.empty:
@@ -518,16 +619,10 @@ def _build_zigzag_signal_report(
     zig_report = apply_zigzag_entry_engine(zig_report, entry_cfg)
 
     zig_report["zigzag_breakout_signal"] = zig_report["entry_signal"].fillna(False).astype(bool)
-    zig_report["entry_source"] = np.select(
-        [
-            zig_report["entry_lane"].eq("tight_reversal"),
-            zig_report["entry_lane"].eq("power_continuation"),
-        ],
-        [
-            "tight_reversal",
-            "power_continuation",
-        ],
-        default="none",
+    zig_report["entry_source"] = np.where(
+        zig_report["entry_lane"].eq("tight_reversal"),
+        "tight_reversal",
+        "none",
     )
     return zig_report
 
@@ -574,7 +669,8 @@ def _merge_standard_and_zigzag_reports(
         "standard_breakout_signal", "zigzag_breakout_signal",
         "entry_source", "entry_lane", "entry_stop_policy",
         "same_day_priority_score",
-        "entry_dist_above_line_pct", "gap_pct", "entry_filter_reason",
+        "entry_dist_above_line_pct", "entry_dist_norm",
+        "gap_pct", "positive_gap_norm", "entry_filter_reason",
         "trigger_pts_breakout", "trigger_pts_price_expansion",
         "trigger_pts_reversal", "trigger_pts_hold",
         "broke_out",
@@ -595,9 +691,8 @@ def _merge_standard_and_zigzag_reports(
         [
             report["entry_source"].eq("standard_breakout"),
             report["entry_source"].eq("tight_reversal"),
-            report["entry_source"].eq("power_continuation"),
         ],
-        [0, 1, 2],
+        [0, 1],
         default=99,
     )
 
@@ -652,7 +747,6 @@ def build_breakout_signal_report(
             standard_breakout_count=("standard_breakout_signal", lambda s: int(pd.Series(s).fillna(False).astype(bool).sum())),
             zigzag_breakout_count=("zigzag_breakout_signal", lambda s: int(pd.Series(s).fillna(False).astype(bool).sum())),
             tight_reversal_count=("entry_source", lambda s: int((pd.Series(s) == "tight_reversal").sum())),
-            power_continuation_count=("entry_source", lambda s: int((pd.Series(s) == "power_continuation").sum())),
         )
         .sort_values("date")
         .reset_index(drop=True)

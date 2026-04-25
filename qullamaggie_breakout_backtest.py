@@ -342,9 +342,8 @@ def prepare_signals(signals: pd.DataFrame) -> pd.DataFrame:
             [
                 sig["entry_source"].eq("standard_breakout"),
                 sig["entry_source"].eq("tight_reversal"),
-                sig["entry_source"].eq("power_continuation"),
             ],
-            [0, 1, 2],
+            [0, 1],
             default=99,
         )
 

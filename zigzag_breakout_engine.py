@@ -238,12 +238,43 @@ def _compute_zigzag_setup_daily(
         if len(high_pivots) < 2:
             continue
 
-        for i in range(len(sub)):
-            confirmed_highs = [
-                p
-                for p in high_pivots
-                if (p["idx"] + pivot_confirm_bars) <= i and p["idx"] < i
-            ]
+        m = len(sub)
+        dates_arr = pd.to_datetime(sub["date"]).to_numpy(dtype="datetime64[ns]")
+        high_arr = sub["high"].to_numpy(dtype="float64")
+        low_arr = sub["low"].to_numpy(dtype="float64")
+        close_arr = sub["close"].to_numpy(dtype="float64")
+        volume_arr = sub["volume"].to_numpy(dtype="float64")
+        vol20_arr = sub["vol20"].to_numpy(dtype="float64")
+
+        high1_date = np.full(m, np.datetime64("NaT"), dtype="datetime64[ns]")
+        high2_date = np.full(m, np.datetime64("NaT"), dtype="datetime64[ns]")
+        high1_price = np.full(m, np.nan, dtype="float64")
+        high2_price = np.full(m, np.nan, dtype="float64")
+        high_gap = np.full(m, np.nan, dtype="float64")
+        age_arr = np.full(m, np.nan, dtype="float64")
+        line_value_arr = np.full(m, np.nan, dtype="float64")
+        line_prev_arr = np.full(m, np.nan, dtype="float64")
+        line_slope_arr = np.full(m, np.nan, dtype="float64")
+        line_valid_arr = np.zeros(m, dtype=bool)
+        setup_raw_arr = np.full(m, np.nan, dtype="float64")
+        pts_line_valid_arr = np.full(m, np.nan, dtype="float64")
+        pts_proximity_arr = np.full(m, np.nan, dtype="float64")
+        pts_spacing_arr = np.full(m, np.nan, dtype="float64")
+        pts_age_arr = np.full(m, np.nan, dtype="float64")
+        pts_slope_arr = np.full(m, np.nan, dtype="float64")
+        pts_tightness_arr = np.full(m, np.nan, dtype="float64")
+        pts_dryup_arr = np.full(m, np.nan, dtype="float64")
+
+        confirmed_highs: list[dict[str, Any]] = []
+        high_ptr = 0
+        for i in range(m):
+            while high_ptr < len(high_pivots):
+                pivot = high_pivots[high_ptr]
+                if (pivot["idx"] + pivot_confirm_bars) <= i and pivot["idx"] < i:
+                    confirmed_highs.append(pivot)
+                    high_ptr += 1
+                else:
+                    break
             if len(confirmed_highs) < 2:
                 continue
 
@@ -265,16 +296,21 @@ def _compute_zigzag_setup_daily(
             line_prev = h2["price"] + slope * (i - 1 - h2["idx"])
 
             recent_start = max(h2["idx"] + 1, i - 5 + 1)
-            recent_slice = sub.iloc[recent_start : i + 1].copy()
-            if recent_slice.empty:
+            if recent_start > i:
                 continue
 
-            recent_range_pct = (recent_slice["high"].max() - recent_slice["low"].min()) / max(line_value, 1e-9)
-            recent_vol_ratio = recent_slice["volume"].tail(min(3, len(recent_slice))).mean() / max(float(sub.iloc[i]["vol20"]) if pd.notna(sub.iloc[i]["vol20"]) else np.nan, 1e-9)
+            recent_high = np.nanmax(high_arr[recent_start : i + 1])
+            recent_low = np.nanmin(low_arr[recent_start : i + 1])
+            recent_range_pct = (recent_high - recent_low) / max(line_value, 1e-9)
+
+            vol_tail_start = max(recent_start, i - 2)
+            recent_vol_mean = np.nanmean(volume_arr[vol_tail_start : i + 1])
+            vol20_i = vol20_arr[i]
+            recent_vol_ratio = recent_vol_mean / max(float(vol20_i) if np.isfinite(vol20_i) else np.nan, 1e-9)
             if not np.isfinite(recent_vol_ratio):
                 recent_vol_ratio = np.nan
 
-            close_now = float(sub.iloc[i]["close"])
+            close_now = float(close_arr[i])
             proximity = abs((line_value - close_now) / max(line_value, 1e-9))
 
             line_valid_score = 1.0
@@ -295,25 +331,43 @@ def _compute_zigzag_setup_daily(
                 + 10.0 * dryup_score
             )
 
-            row_idx = locs[i]
-            out.at[row_idx, "zigzag_high1_date"] = pd.Timestamp(h1["date"])
-            out.at[row_idx, "zigzag_high1_price"] = h1["price"]
-            out.at[row_idx, "zigzag_high2_date"] = pd.Timestamp(h2["date"])
-            out.at[row_idx, "zigzag_high2_price"] = h2["price"]
-            out.at[row_idx, "zigzag_high_gap_bars"] = gap
-            out.at[row_idx, "zigzag_age_bars"] = age
-            out.at[row_idx, "zigzag_line_value"] = line_value
-            out.at[row_idx, "zigzag_line_prev"] = line_prev
-            out.at[row_idx, "zigzag_line_slope"] = slope
-            out.at[row_idx, "zigzag_line_valid"] = True
-            out.at[row_idx, "zigzag_setup_raw"] = setup_score_raw
-            out.at[row_idx, "setup_pts_line_valid"] = 20.0 * line_valid_score
-            out.at[row_idx, "setup_pts_proximity"] = 20.0 * proximity_score
-            out.at[row_idx, "setup_pts_spacing"] = 15.0 * spacing_score
-            out.at[row_idx, "setup_pts_age"] = 15.0 * age_score
-            out.at[row_idx, "setup_pts_slope"] = 10.0 * slope_score
-            out.at[row_idx, "setup_pts_tightness"] = 10.0 * tightness_score
-            out.at[row_idx, "setup_pts_dryup"] = 10.0 * dryup_score
+            high1_date[i] = dates_arr[h1["idx"]]
+            high1_price[i] = h1["price"]
+            high2_date[i] = dates_arr[h2["idx"]]
+            high2_price[i] = h2["price"]
+            high_gap[i] = gap
+            age_arr[i] = age
+            line_value_arr[i] = line_value
+            line_prev_arr[i] = line_prev
+            line_slope_arr[i] = slope
+            line_valid_arr[i] = True
+            setup_raw_arr[i] = setup_score_raw
+            pts_line_valid_arr[i] = 20.0 * line_valid_score
+            pts_proximity_arr[i] = 20.0 * proximity_score
+            pts_spacing_arr[i] = 15.0 * spacing_score
+            pts_age_arr[i] = 15.0 * age_score
+            pts_slope_arr[i] = 10.0 * slope_score
+            pts_tightness_arr[i] = 10.0 * tightness_score
+            pts_dryup_arr[i] = 10.0 * dryup_score
+
+        out.loc[locs, "zigzag_high1_date"] = pd.to_datetime(high1_date)
+        out.loc[locs, "zigzag_high1_price"] = high1_price
+        out.loc[locs, "zigzag_high2_date"] = pd.to_datetime(high2_date)
+        out.loc[locs, "zigzag_high2_price"] = high2_price
+        out.loc[locs, "zigzag_high_gap_bars"] = high_gap
+        out.loc[locs, "zigzag_age_bars"] = age_arr
+        out.loc[locs, "zigzag_line_value"] = line_value_arr
+        out.loc[locs, "zigzag_line_prev"] = line_prev_arr
+        out.loc[locs, "zigzag_line_slope"] = line_slope_arr
+        out.loc[locs, "zigzag_line_valid"] = line_valid_arr
+        out.loc[locs, "zigzag_setup_raw"] = setup_raw_arr
+        out.loc[locs, "setup_pts_line_valid"] = pts_line_valid_arr
+        out.loc[locs, "setup_pts_proximity"] = pts_proximity_arr
+        out.loc[locs, "setup_pts_spacing"] = pts_spacing_arr
+        out.loc[locs, "setup_pts_age"] = pts_age_arr
+        out.loc[locs, "setup_pts_slope"] = pts_slope_arr
+        out.loc[locs, "setup_pts_tightness"] = pts_tightness_arr
+        out.loc[locs, "setup_pts_dryup"] = pts_dryup_arr
 
     out["setup_score_pre"] = out.groupby("symbol", sort=False)["zigzag_setup_raw"].shift(1)
     out["zigzag_line_prevday"] = out.groupby("symbol", sort=False)["zigzag_line_value"].shift(1)
@@ -344,6 +398,7 @@ def compute_zigzag_breakout_scores(
         "volume",
         "prev_close",
         "atr20",
+        "adr20_pct",
         "vol20",
         "history_ok",
         "leader_pass",
