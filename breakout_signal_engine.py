@@ -158,6 +158,13 @@ def compute_breakout_scores_with_diag(
     out["sma20"] = groll_mean("close", 20)
     out["atr5"] = groll_mean("tr", 5)
     out["atr20"] = groll_mean("tr", 20)
+    range_pct = (out["high"] - out["low"]) / out["close"].replace(0, np.nan)
+    out["adr20_pct"] = (
+        range_pct.groupby(out["symbol"], sort=False)
+        .rolling(20, min_periods=20)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
     out["vol5"] = groll_mean("volume", 5)
     out["vol20"] = groll_mean("volume", 20)
 
