@@ -50,6 +50,31 @@ Backtester:
 python scripts/backtest.py
 ```
 
+Industry Theme EP Swing 日次判定:
+
+```bash
+python scripts/hybrid_swing_daily_report.py --as-of 2026-06-03 --case-study --send-discord
+```
+
+この日次判定は発注やポートフォリオ配分を行わず、10年検証で本命候補になった
+`industry_theme_ep_ex_biotech / pullback10 / stage2_or_atr8` を日足終値後に評価します。
+
+| 区分 | 内容 |
+|---|---|
+| `Entry候補` | 強いIndustry内でバイオ以外のEPが出た銘柄が、20営業日以内に10MA押し目維持を確認したもの |
+| `継続` | 既存ポジションがEP安値割れ、ATR8トレーリング、Stage2崩れに触れていない銘柄 |
+| `Exit` | EP安値割れ、ATR8トレーリング割れ、Stage2崩れが発生した銘柄 |
+
+Signal条件は、株価1ドル以上、20日平均売買代金100万ドル以上、出来高2倍以上のEP、Industry 60日中央値リターン10%以上、個別60日リターンのIndustry残差15%以上、Biotechnology除外です。EntryはSignal当日ではなく、10MA押し目維持を終値で確認した翌営業日の寄り付きです。
+
+任意の保有銘柄を評価する場合はCSVを渡します。
+
+```bash
+python scripts/hybrid_swing_daily_report.py --as-of 2026-06-03 --positions-csv data/hybrid_positions.csv --send-discord
+```
+
+`positions-csv` の主な列は `symbol`, `entry_reason`, `signal_date`, `entry_date`, `ep_low_stop_used` です。`entry_price` と `signal_low` は省略可能で、省略時は日足から補完します。
+
 Tax reserve manager:
 
 ```bash
