@@ -50,6 +50,29 @@ Backtester:
 python scripts/backtest.py
 ```
 
+Industry Theme EP Swing daily report:
+
+```bash
+python scripts/hybrid_swing_daily_report.py --as-of 2026-06-03 --case-study --send-discord
+```
+
+This close-of-day report does not place orders or allocate a portfolio. It evaluates the researched
+`industry_theme_ep_ex_biotech / pullback10 / stage2_or_atr8` daily-bar strategy:
+
+| Bucket | Meaning |
+|---|---|
+| `Entry candidates` | Non-biotech stocks in strong industries that triggered an EP and then confirmed a 10SMA pullback within 20 sessions |
+| `Holds` | Existing positions that have not breached EP low, ATR8 trailing stop, or Stage 2 failure |
+| `Exits` | Positions that breached EP low, ATR8 trailing stop, or Stage 2 failure |
+
+Signal requirements are: price at least $1, 20-day average dollar volume at least $1M, EP volume at least 2x average volume, industry 60-day median return at least +10%, stock 60-day return at least +15% above its industry median, and Biotechnology excluded. Entry is the next open after the 10SMA pullback confirmation, not the EP day.
+
+To evaluate custom open/research positions:
+
+```bash
+python scripts/hybrid_swing_daily_report.py --as-of 2026-06-03 --positions-csv data/hybrid_positions.csv --send-discord
+```
+
 Tax reserve manager:
 
 ```bash
